@@ -146,12 +146,11 @@ Workloads:
 - **Lock + inc** — 256 hot keys, `Lock(k)` + `*p++` + `Unlock(k)` (no
   alloc once warm).
 
-All `ns/op` numbers below are wall-clock-per-iteration; the
-`Allocations per operation` table further down complements them with
-the `B/op` and `allocs/op` view (which the structures' inline-`V`
-design is mainly about).
+Below: one **Speed** table and one **Memory** table, same row order
+in both, read them side by side. ns/op is wall-clock-per-iteration;
+B/op + allocs/op are the inline-`V` design's whole point.
 
-### `Map[K,V]` — generic hash map (int → int)
+### Speed — `ns/op` (lower is better)
 
 | Implementation                       | ReadOnly    | ReadHeavy   | Store        | GrowStore    | Churn        | LoadOrStore | Range/key   |
 |--------------------------------------|------------:|------------:|-------------:|-------------:|-------------:|------------:|------------:|
@@ -161,85 +160,82 @@ design is mainly about).
 | `sync.Map` (stdlib)                  |     3.09 ns |     8.97 ns |       118 ns |          —   |      88.3 ns |    10.33 ns |     4.99 ns |
 | `xsync.Map` v4                       |     1.03 ns |     3.38 ns |      89.2 ns |      95.2 ns |      15.4 ns |     1.35 ns |     4.37 ns |
 | **`fsync.Map`**                      | **1.56 ns** | **6.06 ns** |  **74.4 ns** |  **73.0 ns** |  **18.0 ns** | **1.59 ns** | **2.21 ns** |
+| **`fsync.Store`**                    | **0.75 ns** | **0.95 ns** |  **3.47 ns** |          —   |  **2.18 ns** | **1.10 ns** | **1.42 ns** |
+| **`fsync.MutexStore`**               |     1.04 ns |     1.14 ns |      3.15 ns |          —   |      3.12 ns |     1.19 ns |     3.69 ns |
+
+`Store` and `MutexStore` use a dense `int64` key and skip hashing
+entirely — that's where the order-of-magnitude jump on `Store`
+(3.47 vs 74.4 ns) and `Churn` (2.18 vs 18.0 ns) comes from. Treat
+their rows as "the cost of the same workload once the key happens
+to be a dense integer".
 
 Highlights:
 
 - `fsync.Map.LoadOrStore` at **1.59 ns** is **6.5× faster than
   `sync.Map` (10.33 ns)** on the hot get-or-set path, and within ~18 %
   of `xsync.Map` (1.35 ns) — drop-in replacement parity.
-- `fsync.Map.Range/key` at **2.21 ns** is the **fastest iterator** of
-  the three: 2.3× faster than `sync.Map` (4.99 ns) and 2.0× faster than
-  `xsync.Map` (4.37 ns), thanks to the inline `[8]V` bucket layout
-  (one cacheline read per 8 entries).
-- `fsync.Map` Load (1.56 ns) sits between a plain `map[int]int` (1.39
-  ns) and `sync.Map` (3.09 ns) — ~12 % overhead vs the lockless
-  baseline buys full concurrent safety AND `Lock(*V)` semantics.
-- `xsync.Map` (1.03 ns) edges everyone on Load thanks to its tighter
-  bucket layout — it has no pin-word to read.
-- `GrowStore` on `fsync.Map` is within 2 % of `Store` (no Grow): the
-  table is allocated up-front so concurrent Stores no longer race on
-  rebuild. `xsync.WithPresize` shows similar behavior but with higher
-  run-to-run variance.
-- `Churn` (rolling window Store+Delete) is where `xsync.Map` (15.4 ns)
-  shines vs `fsync.Map` (18.0 ns). Both crush stdlib maps with locks
-  (~60 ns) and `sync.Map` (88.3 ns).
+- `fsync.Map.Range/key` at **2.21 ns** is the **fastest iterator**
+  among hashed maps: 2.3× faster than `sync.Map` (4.99 ns) and 2.0×
+  faster than `xsync.Map` (4.37 ns), thanks to the inline `[8]V`
+  bucket layout (one cacheline read per 8 entries). `fsync.Store`
+  goes further still at **1.42 ns/entry** with its `[32]V` slots.
+- `fsync.Map` Load (1.56 ns) sits between a plain `map[int]int`
+  (1.39 ns) and `sync.Map` (3.09 ns) — ~12 % overhead vs the
+  lockless baseline buys full concurrent safety AND `Lock(*V)`
+  semantics. `xsync.Map` (1.03 ns) edges everyone on Load thanks
+  to its tighter bucket layout (no pin-word to read).
+- `fsync.Store.ReadOnly` at **0.75 ns** is the fastest concurrent
+  Load benchmarked here — it beats `xsync.Map` (1.03 ns) because
+  integer-indexed slots skip hashing entirely.
+- `GrowStore` on `fsync.Map` is within 2 % of `Store` (no Grow):
+  the table is allocated up-front so concurrent Stores no longer
+  race on rebuild. `xsync.WithPresize` shows similar behavior but
+  with higher run-to-run variance.
+- `Churn` (rolling window Store+Delete) is where `xsync.Map` (15.4
+  ns) shines vs `fsync.Map` (18.0 ns). Both crush stdlib maps with
+  locks (~60 ns) and `sync.Map` (88.3 ns).
+- On Store vs MutexStore: `Store` wins on Load/Churn/LoadOrStore
+  (lock-free bit-spin), `MutexStore` wins on raw Store throughput
+  (~9 % faster — futex is cheaper than the bit-spin for write-heavy
+  workloads). Pin-heavy workloads depend on contention regime — see
+  the dedicated `Lock + inc` table below.
 
-### Allocations per operation
+### Memory — `B/op` and `allocs/op` per call
 
-A defining feature of `fsync` is **zero heap allocation on the hot
-path**. The `[8]V` slots inline in each bucket mean no per-entry
-heap object: a `Load` or steady-state `LoadOrStore` allocates
-nothing, a `Lock(k)` hands back a `*V` straight into the bucket
-(no `*Entry`, no boxing), and `Store` allocates only the bucket
-itself, which gets amortized over many inserts. Headline numbers
-from `go test -benchmem` (median of 3 runs at `-benchtime=2s`):
+Same row order as above; lower is better. The columns hit the three
+operations where memory cost matters most: bulk `Store`,
+steady-state `LoadOrStore`, and the per-entry locking pattern.
 
-| Operation                                            | `fsync.Map`         | `xsync.Map`            | `sync.Map`              |
-|------------------------------------------------------|--------------------:|-----------------------:|------------------------:|
-| `LoadOrStore` (preloaded, every call a hit)          | **0 B / 0 allocs**  | 0 B / 0 allocs         | 14 B / **1 alloc**      |
-| `Store` (insert distinct keys, write-only)           | 83 B / **0 allocs** | 84 B / **1 alloc**     | 126 B / **3 allocs**    |
-| `Lock + inc` (`Lock(k)` + `*p++` + `Unlock`)¹        | **0 B / 0 allocs**  | 16 B / 1 alloc (first) | 16 B / 1 alloc (first)  |
-| `LockOrStore + inc` (atomic insert-and-pin + `*p++`)¹| **0 B / 0 allocs**  | 16 B / 1 alloc         | 16 B / 1 alloc          |
+| Implementation                       | Store                | LoadOrStore     | Lock + inc¹                     |
+|--------------------------------------|---------------------:|----------------:|--------------------------------:|
+| `sync.Map` (stdlib)                  |  126 B / 3 allocs    | 14 B / 1 alloc  | 16 B / 1 alloc (first insert)   |
+| `xsync.Map` v4                       |   84 B / 1 alloc     |  0 B / 0 allocs | 16 B / 1 alloc (first insert)   |
+| **`fsync.Map`**                      | **83 B / 0 allocs**ᵃ |  **0 B / 0 allocs** | **0 B / 0 allocs**          |
+| **`fsync.Store`**                    |  **1 B / 0 allocs**ᵃ |  **0 B / 0 allocs** | **0 B / 0 allocs**          |
+| **`fsync.MutexStore`**               |  **2 B / 0 allocs**ᵃ |  **0 B / 0 allocs** | **0 B / 0 allocs**          |
 
-¹ `xsync.Map` and `sync.Map` have no native `Lock(*V)` API; the
+ᵃ **Amortized bucket allocation.** `fsync` allocates whole buckets,
+not entries: one bucket covers 8 entries on `Map`, 32 on `Store`,
+64 on `MutexStore`. On a stream of inserts the per-op alloc count
+drops below 1 and rounds to 0. The amortized memory cost is the
+`B/op` figure — most of `fsync.Map`'s 83 B is the bucket struct
+divided by ~8, and `Store`'s 1 B is the bucket struct (~264 B)
+divided by 32 amortized over millions of iterations on the same
+hot slots.
+
+¹ `sync.Map` and `xsync.Map` have no native `Lock(*V)` API; the
 canonical Go workaround is to store `*mutexedEntry{mu sync.Mutex;
-v V}` instead of `V` itself, then `Load(k)` and take `e.mu.Lock()`.
-The 16 B / 1 alloc visible above is the **caller's pre-allocated
-`&mutexedEntry{}`** passed to `LoadOrStore` on each iteration.
-Subsequent Loads on the same key are 0 alloc once the entry is in
-place. `fsync.Map.Lock` and `LockOrStore` return a stable `*V`
-*into the bucket itself* — zero `*Entry`, zero allocation, on every
-key including the first insert. This is the structural win behind
-`fsync.Map`'s pin-based API.
-
-**Caveat on the "1 alloc" reading.** On top of the 16 B / 1 alloc
-the caller pays, `xsync.Map` and `sync.Map` ALSO allocate an
-internal `entry{key, value}` struct on each FIRST insert
-(`new(entry[K, V])` in xsync, see `map.go:433`; similar in
-stdlib `sync.Map`). On `xsync.Map[int, *mutexedEntry]` that's
-roughly 16 B (int + ptr) of internal allocation. The benchmark
-loops over 256 hot keys for millions of iterations, so those 256
-internal allocations get amortized to ~0 per op and stay
-invisible in the `B/op` / `allocs/op` figure. The true cost of a
-genuine first insert is therefore closer to **2 allocs ≈ 32 B**
-(the caller's `*mutexedEntry` AND the lib's internal entry), not
-1 alloc. Same correction applies on the `Store` (insert int → int)
-row: the 84 B / 1 alloc of `xsync.Map.Store` IS the internal
-entry alloc (no caller boxing involved with a pure-int V); the
-126 B / 3 allocs of `sync.Map.Store` is the internal entry + the
-two `interface{}` box allocs around key and value.
-
-`fsync.Map`, in contrast, has **no `*entry` indirection at all**:
-the `[8]V` inline bucket IS the entry. The 83 B / 0 allocs on
-`fsync.Map.Store` is the amortized bucket allocation — and no
-internal per-entry struct exists to allocate. So even on a stream
-of strictly first-insert calls there is no hidden second
-allocation lurking behind the headline number.
-
-The `fsync.Map.Store` row reports **0 allocs/op** even though
-83 B/op got allocated: each bucket alloc covers up to 8 inserts, so
-the per-op count is below 1 and rounds to zero. The amortized
-memory cost is the 83 B/op figure.
+v V}` instead of `V` itself, then `Load(k)` and take
+`e.mu.Lock()`. The 16 B / 1 alloc visible above is the caller's
+`new(mutexedEntry)` paid once per first-time key (and amortized to
+0 on subsequent Lock+inc on the same key). Both libs also allocate
+an internal `entry{key, value}` struct on each first insert that
+the benchmark amortizes invisibly across millions of iterations on
+256 hot keys — the genuine first-insert cost is closer to **2
+allocs ≈ 32 B**, not 1 alloc. `fsync.*.Lock` and `LockOrStore`
+return a stable `*V` straight into the inline slot, no `*Entry`
+indirection on any path, no first-insert spike, on every key from
+the very first one.
 
 ### Per-entry locking pattern under three contention regimes
 
@@ -312,33 +308,6 @@ Notes:
 |---------------------------------|------------:|
 | `sync.Map[string]int`           |     3.09 ns |
 | **`fsync.Map[string]int`**      | **2.79 ns** |
-
-### `Store[V]` and `MutexStore[V]` — dense integer-indexed (int64 → V)
-
-Integer keys mean no hashing, no chaining; slot lookup is one shift and
-one bit test. `Store` is fully lock-free (bit-based pin/used);
-`MutexStore` keeps a `sync.Mutex` per slot.
-
-| Implementation        | ReadOnly    | ReadHeavy   | Store       | Churn       | LoadOrStore | Range/key   |
-|-----------------------|------------:|------------:|------------:|------------:|------------:|------------:|
-| **`fsync.Store`**     | **0.75 ns** | **0.95 ns** | **3.47 ns** | **2.18 ns** | **1.10 ns** | **1.42 ns** |
-| `fsync.MutexStore`    |     1.04 ns |     1.14 ns |     3.15 ns |     3.12 ns |     1.19 ns |     3.69 ns |
-
-Reading: `Store` wins on Load (~28 % faster), Churn (~30 % faster) and
-LoadOrStore (~8 % faster); `MutexStore` wins on raw Store throughput
-(~9 % faster, the mutex is cheaper than the bit-spin for write-heavy
-workloads) and on the moderate Lock+inc workload (see Lock+inc table
-above). The Lock+inc winner depends on the contention regime — see
-the Lock+inc section.
-
-`fsync.Store.ReadOnly` at **0.75 ns/op** is the fastest concurrent map
-Load benchmarked here — it beats `xsync.Map` (1.03 ns) because
-integer-indexed slots skip hashing entirely.
-
-`fsync.Store.LoadOrStore` at **1.10 ns/op** matches its raw Load cost
-within ~50 % (the pin acquire+release on a guaranteed-hit), and the
-equivalent `Range/key` at **1.42 ns** is the fastest iteration
-benchmarked here.
 
 ### Scaling from `GOMAXPROCS=1` to `12` — drop-in for a non-concurrent map?
 
