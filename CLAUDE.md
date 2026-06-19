@@ -321,3 +321,21 @@ Tout est commit ; tests + race + benchs verts.
 - **Commentaires dans le code souvent obsolètes** : héritages
   d'anciennes implémentations (deltas négatifs, layout iln, etc.).
   Se fier au code, pas aux commentaires.
+
+## Rappel — PR awesome-go (≥ 2026-11-19)
+
+PR awesome-go pour `fsync` à soumettre **à partir du 2026-11-19** (5 mois
+après le premier commit, critère bloquant awesome-go).
+
+- Matériel pré-rédigé : `~/Aytechnet/github/fsync-awesome-go-pr.md`
+  (entrée exacte, rubrique cible `### Maps`, position alphabétique
+  entre `dict` et `go-shelve`, PR body avec liens).
+- Branche prête : `aytechnet/awesome-go` → `add-fsync` (commit
+  `47eadc1`). À **rebaser sur `upstream/main`** au moment de la PR
+  car la liste awesome-go bouge.
+- Avant de soumettre, revérifier :
+  - pkg.go.dev répond 200 sur
+    https://pkg.go.dev/github.com/aytechnet/fsync ;
+  - Go Report Card affiche toujours A+ ;
+  - Codecov affiche la couverture à jour ;
+  - position alphabétique encore correcte dans la rubrique Maps.
