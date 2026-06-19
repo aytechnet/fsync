@@ -1,0 +1,10 @@
+# Manual versioning snapshots (map.go.x*, store.go.s1, ...)
+*.x*
+*.s1*
+# Coverage profiles / build output
+c.out
+*.out
+# Editor temp files
+*~
+.*kate-swp
+.test
