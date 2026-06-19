@@ -17,6 +17,12 @@ type (
 	tableStore struct {
 		buckets []unsafe.Pointer
 	}
+	// Store is a lock-free concurrent container of V values indexed by
+	// int64. Buckets hold 32 values each inline so Lock returns a
+	// stable *V into the bucket itself, with no per-entry heap
+	// allocation. Slot index is `i - start` so callers can build a
+	// dense index from a domain-specific id. The zero value is
+	// usable: the first write lazy-allocates the initial table.
 	Store[V any] struct {
 		start    int64
 		table    atomic.Pointer[tableStore]
@@ -31,30 +37,37 @@ type (
 	tableMutexStore struct {
 		buckets []unsafe.Pointer
 	}
+	// MutexStore is the mutex-per-slot variant of Store: 64 values
+	// and 64 sync.Mutex per bucket. Trades the lock-free bit-spin
+	// for a futex-based wait; faster than Store under moderate Lock
+	// contention spread over a handful of buckets, slower on the
+	// pure Load/Store hot paths and on single-key contention. Same
+	// usability properties as Store: stable *V from Lock, zero value
+	// usable, `start` offset for dense indexing.
 	MutexStore[V any] struct {
 		start    int64
 		table    atomic.Pointer[tableMutexStore]
 		newTable atomic.Pointer[tableMutexStore]
 	}
 
-	// StoreCursor[V] is a handle on a pinned slot returned by Store.Lock /
-	// Store.LockOrStore. It carries a direct pointer to the bucket (which
-	// is stable — buckets are never relocated) plus the slot index inside
-	// it, so Unlock is one atomic And on the bucket's lockused word with
-	// no table / bucket index re-lookup. bi is a plain uint always
-	// masked with `& 31` at use sites; this lets the compiler skip
-	// bounds checks on values[bi] / mutexes[bi]. Idiomatic use:
-	// `defer cur.Unlock()` immediately after a successful Lock /
-	// LockOrStore.
+	// StoreCursor is a handle on a pinned slot returned by Store.Lock
+	// / Store.LockOrStore. It carries a direct pointer to the bucket
+	// (which is stable — buckets are never relocated) plus the slot
+	// index inside it, so Unlock is one atomic And on the bucket's
+	// lockused word with no table / bucket index re-lookup. bi is a
+	// plain uint always masked with `& 31` at use sites; this lets
+	// the compiler skip bounds checks on values[bi] / mutexes[bi].
+	// Idiomatic use: `defer cur.Unlock()` immediately after a
+	// successful Lock / LockOrStore.
 	StoreCursor[V any] struct {
 		bucket *bucketStore[V]
 		bi     uint
 	}
 
-	// MutexStoreCursor[V] is a handle on a pinned slot returned by
+	// MutexStoreCursor is a handle on a pinned slot returned by
 	// MutexStore.Lock / MutexStore.LockOrStore. Same direct-pointer
-	// optimization as StoreCursor: Unlock is one mutex.Unlock with no
-	// table lookup. bi is masked with `& 63` at use sites.
+	// optimization as StoreCursor: Unlock is one mutex.Unlock with
+	// no table lookup. bi is masked with `& 63` at use sites.
 	MutexStoreCursor[V any] struct {
 		bucket *bucketMutexStore[V]
 		bi     uint

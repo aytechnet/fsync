@@ -135,13 +135,19 @@ type tableMap[K comparable, V any] struct {
 	nextTable   atomic.Pointer[tableMap[K, V]] // != nil iff a rebuild is in progress
 }
 
+// Map is a generic concurrent hash map of K → V, lock-free on the
+// read path. Slots live inline in fixed-size 8-slot buckets so Lock
+// returns a stable *V into the bucket itself, with no per-entry
+// heap allocation. The zero value is usable: the first write
+// lazy-allocates a small table. See the package README for the full
+// concurrency contract and design rationale.
 type Map[K comparable, V any] struct {
 	seed  uint64
 	live  atomic.Int64
 	table atomic.Pointer[tableMap[K, V]]
 }
 
-// Cursor[K,V] is a handle on a pinned slot returned by Map.Lock /
+// Cursor is a handle on a pinned slot returned by Map.Lock /
 // Map.LockOrStore. slotIdx is stored as a plain uint and always masked
 // with `& 7` at the access sites; this lets the compiler prove the
 // index is in [0, slotCount) and skip the slice bounds check on
@@ -507,10 +513,11 @@ func (cur Cursor[K, V]) Unlock() {
 	}
 }
 
-// LockOrStore: if key is present, behaves like Lock and returns the
-// existing slot's *V with created=false. Otherwise inserts (key, value),
-// pins the new slot, returns &value with created=true. Both paths return
-// a cursor for Unlock.
+// LockOrStore atomically locks the slot for key, returning a stable
+// *V along with a cursor for Unlock. If the key is already present,
+// behaves like Lock and returns the existing slot's *V with
+// created=false. Otherwise inserts (key, value), pins the new slot,
+// and returns &value with created=true.
 func (m *Map[K, V]) LockOrStore(key K, value V) (*V, Cursor[K, V], bool) {
 	h := m.hash(key)
 	tag := uint64(slotTag(h))
@@ -971,9 +978,11 @@ func (m *Map[K, V]) helpMigrateBucket(t *tableMap[K, V], idx uint64) {
 func (m *Map[K, V]) migrateBucket(t, nt *tableMap[K, V], idx uint64, b *bucketMap[K, V]) (split bool) {
 	oldSize := uint64(len(t.buckets))
 
-	// drain in-flight writers
+	// drain in-flight writers: every other writer that already passed
+	// the state==Open check must finish its in-bucket work (under
+	// b.mu) before we read its tags & pins below.
 	b.mu.Lock()
-	//nolint:staticcheck // intentional empty critical section
+	//lint:ignore SA2001 the Lock/Unlock pair is a barrier, not a real critical section
 	b.mu.Unlock()
 
 	// check pin state across the whole chain (only the low 8 pin bits matter;
