@@ -130,9 +130,9 @@ type bucketMap[K comparable, V any] struct {
 type tableMap[K comparable, V any] struct {
 	buckets     []atomic.Pointer[bucketMap[K, V]]
 	mask        uint64
-	rebuildLeft atomic.Int64                          // buckets still to migrate; promotion when ≤ 0
-	rebuildIdx  atomic.Uint64                         // next bucket index to claim for the lazy sweep
-	nextTable   atomic.Pointer[tableMap[K, V]]   // != nil iff a rebuild is in progress
+	rebuildLeft atomic.Int64                   // buckets still to migrate; promotion when ≤ 0
+	rebuildIdx  atomic.Uint64                  // next bucket index to claim for the lazy sweep
+	nextTable   atomic.Pointer[tableMap[K, V]] // != nil iff a rebuild is in progress
 }
 
 type Map[K comparable, V any] struct {
@@ -995,7 +995,7 @@ func (m *Map[K, V]) migrateBucket(t, nt *tableMap[K, V], idx uint64, b *bucketMa
 		meta := cur.meta.Load()
 		for j := 0; j < slotCount; j++ {
 			tb := uint8(meta >> (8 * j))
-			if tb &occupiedBit == 0 {
+			if tb&occupiedBit == 0 {
 				continue
 			}
 			k := cur.keys[j]

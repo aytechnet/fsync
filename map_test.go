@@ -1,13 +1,13 @@
 package fsync
 
 import (
+	"runtime"
 	"sync"
 	"testing"
-	"runtime"
 )
 
 func TestNewMap(t *testing.T) {
-	var m Map[int,string]
+	var m Map[int, string]
 
 	m.Store(1, "one")
 	if m.Len() != 1 {
@@ -36,7 +36,7 @@ func TestNewMap(t *testing.T) {
 }
 
 func TestStoreMap(t *testing.T) {
-	var m Map[int,int]
+	var m Map[int, int]
 
 	n := 10
 	for i := range n {
@@ -48,7 +48,7 @@ func TestStoreMap(t *testing.T) {
 	}
 
 	for i := range n {
-		if v, ok := m.Load(i+1); !ok {
+		if v, ok := m.Load(i + 1); !ok {
 			t.Errorf("Map item at %d should exists", i)
 		} else if v != i*7 {
 			t.Errorf(`Map item at %d should equal to %d (value is %d)`, i, v, i*7)
@@ -57,7 +57,7 @@ func TestStoreMap(t *testing.T) {
 }
 
 func TestBigMap(t *testing.T) {
-	var m Map[int,int]
+	var m Map[int, int]
 	var w sync.WaitGroup
 
 	count := 100000
@@ -74,8 +74,8 @@ func TestBigMap(t *testing.T) {
 	}
 	w.Wait()
 
-	if l := m.Len(); l != count * cpus {
-		t.Errorf("Map length should be %d, got %d", count * cpus, l)
+	if l := m.Len(); l != count*cpus {
+		t.Errorf("Map length should be %d, got %d", count*cpus, l)
 	}
 
 	for i := range count * cpus {
@@ -86,4 +86,3 @@ func TestBigMap(t *testing.T) {
 		}
 	}
 }
-

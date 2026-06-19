@@ -5,8 +5,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/aytechnet/fsync"
+	"github.com/puzpuzpuz/xsync/v4"
 )
 
 // mutexedEntry is the canonical Go pattern when one needs a per-key lock:
@@ -238,7 +238,7 @@ func BenchmarkFsyncMutexStoreLockInc(b *testing.B) {
 // contention-induced cache traffic.
 
 const (
-	uncontendedStride = 256                  // keys per goroutine
+	uncontendedStride = 256                    // keys per goroutine
 	uncontendedTotal  = uncontendedStride * 64 // enough for any GOMAXPROCS up to 64
 )
 
@@ -403,4 +403,3 @@ func BenchmarkFsyncStoreLoadSingleKey(b *testing.B) {
 		}
 	})
 }
-

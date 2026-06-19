@@ -1,9 +1,9 @@
 package fsync
 
 import (
+	"runtime"
 	"sync"
 	"sync/atomic"
-	"runtime"
 )
 
 const queueBlockSize = 64

@@ -3,9 +3,9 @@ package fsync
 import (
 	"testing"
 
+	"runtime"
 	"sync"
 	"sync/atomic"
-	"runtime"
 )
 
 func TestNewStore(t *testing.T) {
@@ -112,8 +112,8 @@ func TestBigStore(t *testing.T) {
 	}
 	w.Wait()
 
-	if l := s.Len(); l != int(count * cpus) {
-		t.Errorf("Store length should be %d, got %d", count * cpus, l)
+	if l := s.Len(); l != int(count*cpus) {
+		t.Errorf("Store length should be %d, got %d", count*cpus, l)
 	}
 
 	for i := range count * cpus {
@@ -143,8 +143,8 @@ func TestBigMutexStore(t *testing.T) {
 	}
 	w.Wait()
 
-	if l := s.Len(); l != int(count * cpus) {
-		t.Errorf("Store length should be %d, got %d", count * cpus, l)
+	if l := s.Len(); l != int(count*cpus) {
+		t.Errorf("Store length should be %d, got %d", count*cpus, l)
 	}
 
 	for i := range count * cpus {
@@ -245,4 +245,3 @@ func TestMutexStoreLockOrStore(t *testing.T) {
 		t.Errorf(`Exactly one concurrent LockOrStore should report created=true, got %d`, creates.Load())
 	}
 }
-

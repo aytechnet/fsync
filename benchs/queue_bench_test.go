@@ -4,8 +4,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/aytechnet/fsync"
+	"github.com/puzpuzpuz/xsync/v4"
 )
 
 // Queue benchmarks. Three workloads:

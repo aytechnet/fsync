@@ -2,11 +2,11 @@ package fsync
 
 import (
 	//"log"
-	"unsafe"
+	"math/bits"
 	"runtime"
 	"sync"
 	"sync/atomic"
-	"math/bits"
+	"unsafe"
 )
 
 type (
@@ -67,7 +67,7 @@ func (s *Store[V]) bucket(i int64) (b *bucketStore[V], index uint) {
 		return
 	}
 
-	index = uint(i-s.start)
+	index = uint(i - s.start)
 
 	bucketIndex := index >> 5
 
@@ -88,11 +88,11 @@ func (s *Store[V]) bucketAlloc(i int64) (b *bucketStore[V], index uint) {
 		return
 	}
 
-	index = uint(i-s.start)
+	index = uint(i - s.start)
 
 	bucketIndex := index >> 5
 
-	Retry:
+Retry:
 
 	// table is never nil unless for empty buckets
 	if table := s.table.Load(); table != nil {
@@ -117,9 +117,9 @@ func (s *Store[V]) bucketAlloc(i int64) (b *bucketStore[V], index uint) {
 						// the store must fix new table as soon as possible
 						if !s.table.CompareAndSwap(table, newTable) {
 							// Invariant: the s.newTable CAS above guards this window;
-						// reaching this branch would mean another goroutine modified
-						// s.table inside it, which the lock discipline forbids. Was
-						// a panic — silenced for lib publication, never reproduced.
+							// reaching this branch would mean another goroutine modified
+							// s.table inside it, which the lock discipline forbids. Was
+							// a panic — silenced for lib publication, never reproduced.
 						}
 
 						table = newTable
@@ -150,8 +150,8 @@ func (s *Store[V]) bucketAlloc(i int64) (b *bucketStore[V], index uint) {
 
 					if !s.newTable.CompareAndSwap(nil, table) {
 						// Invariant: we reserved the table by CAS-ing s.newTable to nil
-					// before allocating the bucket; restoring it must succeed. Was
-					// a panic — silenced for lib publication, never reproduced.
+						// before allocating the bucket; restoring it must succeed. Was
+						// a panic — silenced for lib publication, never reproduced.
 					}
 				} else {
 					//log.Printf("fsync(store): race a new table already exists")
@@ -205,7 +205,7 @@ func (s *MutexStore[V]) bucket(i int64) (b *bucketMutexStore[V], index uint) {
 		return
 	}
 
-	index = uint(i-s.start)
+	index = uint(i - s.start)
 
 	bucketIndex := index >> 6
 
@@ -226,11 +226,11 @@ func (s *MutexStore[V]) bucketAlloc(i int64) (b *bucketMutexStore[V], index uint
 		return
 	}
 
-	index = uint(i-s.start)
+	index = uint(i - s.start)
 
 	bucketIndex := index >> 6
 
-	Retry:
+Retry:
 
 	// table is never nil unless for empty buckets
 	if table := s.table.Load(); table != nil {
@@ -255,9 +255,9 @@ func (s *MutexStore[V]) bucketAlloc(i int64) (b *bucketMutexStore[V], index uint
 						// the store must fix new table as soon as possible
 						if !s.table.CompareAndSwap(table, newTable) {
 							// Invariant: the s.newTable CAS above guards this window;
-						// reaching this branch would mean another goroutine modified
-						// s.table inside it, which the lock discipline forbids. Was
-						// a panic — silenced for lib publication, never reproduced.
+							// reaching this branch would mean another goroutine modified
+							// s.table inside it, which the lock discipline forbids. Was
+							// a panic — silenced for lib publication, never reproduced.
 						}
 
 						table = newTable
@@ -288,8 +288,8 @@ func (s *MutexStore[V]) bucketAlloc(i int64) (b *bucketMutexStore[V], index uint
 
 					if !s.newTable.CompareAndSwap(nil, table) {
 						// Invariant: we reserved the table by CAS-ing s.newTable to nil
-					// before allocating the bucket; restoring it must succeed. Was
-					// a panic — silenced for lib publication, never reproduced.
+						// before allocating the bucket; restoring it must succeed. Was
+						// a panic — silenced for lib publication, never reproduced.
 					}
 				} else {
 					//log.Printf("fsync(store): race a new table already exists")
@@ -467,23 +467,23 @@ func (s *Store[V]) Load(i int64) (value V, ok bool) {
 
 		for {
 			//for range 16 {
-				if oldbits := b.lockused.Or(lockbit) & bits; oldbits == usebit {
-					// entry was used and unlocked
-					value = b.values[bi]
-					ok = true
+			if oldbits := b.lockused.Or(lockbit) & bits; oldbits == usebit {
+				// entry was used and unlocked
+				value = b.values[bi]
+				ok = true
 
-					b.lockused.And(^lockbit)
+				b.lockused.And(^lockbit)
 
-					return
-				} else if oldbits == 0 {
-					// entry was not used and unlocked so unlock it before return
-					b.lockused.And(^lockbit)
+				return
+			} else if oldbits == 0 {
+				// entry was not used and unlocked so unlock it before return
+				b.lockused.And(^lockbit)
 
-					return
-				} else if oldbits == lockbit {
-					// entry was not used but locked so return
-					return
-				} // retry if entry was used and locked
+				return
+			} else if oldbits == lockbit {
+				// entry was not used but locked so return
+				return
+			} // retry if entry was used and locked
 			//}
 
 			//runtime.Gosched()
@@ -561,13 +561,13 @@ func (s *Store[V]) Store(i int64, value V) (created bool) {
 		bits := lockbit | usebit
 
 		for {
-			if oldbits := b.lockused.Or(bits) & bits; oldbits & lockbit == 0 {
+			if oldbits := b.lockused.Or(bits) & bits; oldbits&lockbit == 0 {
 				// entry was unlocked
 				b.values[bi] = value
 
 				b.lockused.And(^lockbit)
 
-				return oldbits & usebit == 0
+				return oldbits&usebit == 0
 			} // retry if entry was locked
 
 			//runtime.Gosched()
@@ -632,8 +632,8 @@ func (s *Store[V]) LoadOrStore(i int64, value V) (actual V, loaded bool) {
 		bits := lockbit | usebit
 
 		for {
-			if oldbits := b.lockused.Or(lockbit) & bits; oldbits & lockbit == 0 {
-				if oldbits & usebit != 0 {
+			if oldbits := b.lockused.Or(lockbit) & bits; oldbits&lockbit == 0 {
+				if oldbits&usebit != 0 {
 					actual = b.values[bi]
 					loaded = true
 				} else {
@@ -661,7 +661,7 @@ func (s *Store[V]) Delete(i int64) (deleted bool) {
 		bi := i & 31
 		usebit := uint64(1) << bi
 
-		if b.lockused.And(^usebit) & usebit != 0 {
+		if b.lockused.And(^usebit)&usebit != 0 {
 			return true
 		}
 	}
@@ -681,8 +681,8 @@ func (s *Store[V]) LoadAndDelete(i int64) (value V, loaded bool) {
 		bits := lockbit | usebit
 
 		for {
-			if oldbits := b.lockused.Or(lockbit) & bits; oldbits & lockbit == 0 {
-				if oldbits & usebit != 0 {
+			if oldbits := b.lockused.Or(lockbit) & bits; oldbits&lockbit == 0 {
+				if oldbits&usebit != 0 {
 					value = b.values[bi]
 					loaded = true
 					// clear both used and lock atomically
@@ -709,14 +709,14 @@ func (s *Store[V]) Swap(i int64, value V) (previous V, loaded bool) {
 		bits := lockbit | usebit
 
 		for {
-			if oldbits := b.lockused.Or(lockbit) & bits; oldbits & lockbit == 0 {
-				if oldbits & usebit != 0 {
+			if oldbits := b.lockused.Or(lockbit) & bits; oldbits&lockbit == 0 {
+				if oldbits&usebit != 0 {
 					previous = b.values[bi]
 					loaded = true
 				}
 				b.values[bi] = value
 				// publish used=1 if it wasn't, then drop the lock
-				if oldbits & usebit == 0 {
+				if oldbits&usebit == 0 {
 					b.lockused.Or(usebit)
 				}
 				b.lockused.And(^lockbit)
@@ -740,8 +740,8 @@ func (s *Store[V]) CompareAndSwap(i int64, old, new V) (swapped bool) {
 		bits := lockbit | usebit
 
 		for {
-			if oldbits := b.lockused.Or(lockbit) & bits; oldbits & lockbit == 0 {
-				if oldbits & usebit != 0 && any(b.values[bi]) == any(old) {
+			if oldbits := b.lockused.Or(lockbit) & bits; oldbits&lockbit == 0 {
+				if oldbits&usebit != 0 && any(b.values[bi]) == any(old) {
 					b.values[bi] = new
 					swapped = true
 				}
@@ -764,8 +764,8 @@ func (s *Store[V]) CompareAndDelete(i int64, old V) (deleted bool) {
 		bits := lockbit | usebit
 
 		for {
-			if oldbits := b.lockused.Or(lockbit) & bits; oldbits & lockbit == 0 {
-				if oldbits & usebit != 0 && any(b.values[bi]) == any(old) {
+			if oldbits := b.lockused.Or(lockbit) & bits; oldbits&lockbit == 0 {
+				if oldbits&usebit != 0 && any(b.values[bi]) == any(old) {
 					deleted = true
 					b.lockused.And(^bits)
 				} else {
@@ -777,7 +777,6 @@ func (s *Store[V]) CompareAndDelete(i int64, old V) (deleted bool) {
 	}
 	return
 }
-
 
 // NewMutexStore returns an empty MutexStore[V]. Same start-offset
 // semantics as NewStore; zero-value is usable.
@@ -887,7 +886,7 @@ func (s *MutexStore[V]) Load(i int64) (value V, ok bool) {
 		bi := i & 63
 		usebit := uint64(1) << bi
 
-		if ok = b.used.Load() & usebit != 0; ok {
+		if ok = b.used.Load()&usebit != 0; ok {
 			b.mutexes[bi].Lock()
 			value = b.values[bi]
 			b.mutexes[bi].Unlock()
@@ -905,7 +904,7 @@ func (s *MutexStore[V]) Lock(i int64) (value *V, cursor MutexStoreCursor[V], ok 
 		bi := idx & 63
 		usebit := uint64(1) << bi
 
-		if b.used.Load() & usebit != 0 {
+		if b.used.Load()&usebit != 0 {
 			b.mutexes[bi].Lock()
 			value = &b.values[bi]
 			cursor = MutexStoreCursor[V]{bucket: b, bi: bi}
@@ -940,7 +939,7 @@ func (s *MutexStore[V]) Store(i int64, value V) (created bool) {
 		b.values[bi] = value
 		b.mutexes[bi].Unlock()
 
-		created = b.used.Or(usebit) & usebit == 0
+		created = b.used.Or(usebit)&usebit == 0
 	}
 
 	return
@@ -963,7 +962,7 @@ func (s *MutexStore[V]) LockOrStore(i int64, value V) (p *V, cursor MutexStoreCu
 		b.mutexes[bi].Lock()
 		// Test used under our mutex so we don't race with Store, which
 		// publishes used AFTER releasing the mutex.
-		if b.used.Load() & usebit == 0 {
+		if b.used.Load()&usebit == 0 {
 			b.values[bi] = value
 			b.used.Or(usebit)
 			created = true
@@ -984,7 +983,7 @@ func (s *MutexStore[V]) LoadOrStore(i int64, value V) (actual V, loaded bool) {
 		usebit := uint64(1 << bi)
 
 		b.mutexes[bi].Lock()
-		if b.used.Load() & usebit != 0 {
+		if b.used.Load()&usebit != 0 {
 			actual = b.values[bi]
 			loaded = true
 		} else {
@@ -1005,7 +1004,7 @@ func (s *MutexStore[V]) Delete(i int64) (deleted bool) {
 		bi := i & 63
 		usebit := uint64(1 << bi)
 
-		if b.used.And(^usebit) & usebit != 0 {
+		if b.used.And(^usebit)&usebit != 0 {
 			return true
 		}
 	}
@@ -1022,7 +1021,7 @@ func (s *MutexStore[V]) LoadAndDelete(i int64) (value V, loaded bool) {
 		usebit := uint64(1 << bi)
 
 		b.mutexes[bi].Lock()
-		if b.used.Load() & usebit != 0 {
+		if b.used.Load()&usebit != 0 {
 			value = b.values[bi]
 			loaded = true
 			b.used.And(^usebit)
@@ -1041,7 +1040,7 @@ func (s *MutexStore[V]) Swap(i int64, value V) (previous V, loaded bool) {
 		usebit := uint64(1 << bi)
 
 		b.mutexes[bi].Lock()
-		if b.used.Load() & usebit != 0 {
+		if b.used.Load()&usebit != 0 {
 			previous = b.values[bi]
 			loaded = true
 		} else {
@@ -1062,7 +1061,7 @@ func (s *MutexStore[V]) CompareAndSwap(i int64, old, new V) (swapped bool) {
 		usebit := uint64(1 << bi)
 
 		b.mutexes[bi].Lock()
-		if b.used.Load() & usebit != 0 && any(b.values[bi]) == any(old) {
+		if b.used.Load()&usebit != 0 && any(b.values[bi]) == any(old) {
 			b.values[bi] = new
 			swapped = true
 		}
@@ -1079,7 +1078,7 @@ func (s *MutexStore[V]) CompareAndDelete(i int64, old V) (deleted bool) {
 		usebit := uint64(1 << bi)
 
 		b.mutexes[bi].Lock()
-		if b.used.Load() & usebit != 0 && any(b.values[bi]) == any(old) {
+		if b.used.Load()&usebit != 0 && any(b.values[bi]) == any(old) {
 			b.used.And(^usebit)
 			deleted = true
 		}
@@ -1087,4 +1086,3 @@ func (s *MutexStore[V]) CompareAndDelete(i int64, old V) (deleted bool) {
 	}
 	return
 }
-
