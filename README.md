@@ -1,5 +1,10 @@
 # fsync — fast concurrent containers for Go
 
+[![ci](https://github.com/aytechnet/fsync/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/aytechnet/fsync/actions/workflows/test.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/aytechnet/fsync.svg)](https://pkg.go.dev/github.com/aytechnet/fsync)
+[![Go Coverage](https://img.shields.io/codecov/c/github/aytechnet/fsync/main?color=brightcolor)](https://codecov.io/gh/aytechnet/fsync)
+[![Go Report Card](https://goreportcard.com/badge/github.com/aytechnet/fsync)](https://goreportcard.com/report/github.com/aytechnet/fsync)
+
 `fsync` is a Go 1.25 library of high-performance concurrent containers
 built for the DyaPi iPaaS platform. It offers three primitives, each
 targeted at a different niche:
