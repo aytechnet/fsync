@@ -3,13 +3,15 @@
 Package `github.com/aytechnet/fsync` : alternatives concurrentes plus rapides que
 `sync.Map` / `puzpuzpuz/xsync` pour la plateforme iPaaS DyaPi. Go 1.25.
 
-Trois structures, trois niches :
+Cinq structures, cinq niches :
 
 | Type            | Clé             | Valeur (inline)            | Niche                                  |
 |-----------------|------------------|----------------------------|----------------------------------------|
 | `Store[V]`      | `int64`          | `[32]V` + `lockused`       | index entier dense, lock-free          |
 | `MutexStore[V]` | `int64`          | `[64]V` + `[64]sync.Mutex` | idem, mutex par slot (contention forte) |
 | `Map[K,V]`      | `K comparable`   | `[8]V` par bucket           | hash map générique concurrente         |
+| `Set[K]`        | `K comparable`   | `[8]K` par bucket (`V=struct{}`) | wrapper typé sur `Map[K, struct{}]` |
+| `Queue[T]`      | —                | `[64]T` par segment        | MPMC FIFO unbounded lock-free          |
 
 Différenciateur central : **`Lock(k)` renvoie un `*V` stable** vers la valeur
 stockée *inline* dans le container. Pas d'allocation d'`*Entry`, pas
@@ -23,10 +25,12 @@ rebuilds (politique « duplicate-on-pin » du Map). Remplace l'idiome canonique
 |----------------------------------|-------------------------------------------------|
 | `store.go`                       | `Store[V]` + `MutexStore[V]`                    |
 | `map.go`                         | `Map[K,V]` (le gros morceau, ~820 l.)            |
-| `queue.go`                       | `Queue[T]` lock-free — historique, plus utilisé par `Map`/`Store` ; conservé pour usage applicatif |
+| `set.go`                         | `Set[K]` — wrapper léger sur `Map[K, struct{}]` (~60 l.) |
+| `queue.go`                       | `Queue[T]` + `MutexQueue[T]` — MPMC FIFO unbounded |
 | `store_test.go`                  | tests séquentiels + concurrents de Store/MutexStore + `LockOrStore` |
 | `map_test.go`, `map_concur_test.go` | tests `Map` (séquentiel, rebuild, pins, concurrent) |
 | `map_load_during_lock_test.go`   | test `Load` pendant `Lock` (build tag `!race`)  |
+| `set_test.go`                    | tests `Set` (séquentiel + concurrent)            |
 | `concur_test.go`                 | tests croisés                                   |
 | `benchs/`                        | sous-package des benchmarks comparatifs         |
 | `README.md`                      | description + tableaux de perf publiables       |
