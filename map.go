@@ -198,12 +198,16 @@ func NewMap[K comparable, V any](estimatedItems int) *Map[K, V] {
 // doubling here is finished synchronously by the caller, so by the time
 // Grow returns the new table is fully promoted and Load/Store hit it
 // directly with no rebuild bookkeeping.
-func (m *Map[K, V]) Grow(estimatedItems int) {
+//
+// Returns the receiver, so calls can be chained:
+//
+//	m := fsync.NewMap[int, string](0).Grow(100_000)
+func (m *Map[K, V]) Grow(estimatedItems int) *Map[K, V] {
 	target := bucketsFor(estimatedItems)
 	for {
 		t := m.loadOrInitTable()
 		if len(t.buckets) >= target {
-			return
+			return m
 		}
 		if t.nextTable.Load() != nil {
 			// a rebuild started by someone else is in flight — help

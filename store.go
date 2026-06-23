@@ -370,9 +370,11 @@ func NewStore[V any](start int64) *Store[V] {
 // table) that would happen if Store discovered the size
 // incrementally. Calls with maxIndex < s.start are a no-op; calls
 // where the existing table is already large enough are a no-op.
-func (s *Store[V]) Grow(maxIndex int64) {
+//
+// Returns the receiver, so calls can be chained.
+func (s *Store[V]) Grow(maxIndex int64) *Store[V] {
 	if maxIndex < s.start {
-		return
+		return s
 	}
 	bucketIndex := uint(maxIndex-s.start) >> 5
 	targetSize := 1 << bits.Len64(uint64(bucketIndex))
@@ -383,7 +385,7 @@ func (s *Store[V]) Grow(maxIndex int64) {
 	for {
 		table := s.table.Load()
 		if table != nil && len(table.buckets) >= targetSize {
-			return
+			return s
 		}
 		if table == nil {
 			// First table: allocate at the target size in one shot.
@@ -393,7 +395,7 @@ func (s *Store[V]) Grow(maxIndex int64) {
 					// Invariant: see bucketAlloc — restoring newTable
 					// must succeed if no one else owns this window.
 				}
-				return
+				return s
 			}
 			continue // another goroutine made the first table; retry
 		}
@@ -406,7 +408,7 @@ func (s *Store[V]) Grow(maxIndex int64) {
 				if !s.table.CompareAndSwap(table, bigger) {
 					// Invariant: same as bucketAlloc.
 				}
-				return
+				return s
 			}
 		}
 		// Someone else holds the resize window; retry.
@@ -804,9 +806,11 @@ func NewMutexStore[V any](start int64) *MutexStore[V] {
 // buckets themselves. Same semantics as Store.Grow but with
 // MutexStore's 64-slot bucket size: the bucket-index shift is `>> 6`
 // instead of `>> 5`, and the first-table minimum is 16 instead of 32.
-func (s *MutexStore[V]) Grow(maxIndex int64) {
+//
+// Returns the receiver, so calls can be chained.
+func (s *MutexStore[V]) Grow(maxIndex int64) *MutexStore[V] {
 	if maxIndex < s.start {
-		return
+		return s
 	}
 	bucketIndex := uint(maxIndex-s.start) >> 6
 	targetSize := 1 << bits.Len64(uint64(bucketIndex))
@@ -817,7 +821,7 @@ func (s *MutexStore[V]) Grow(maxIndex int64) {
 	for {
 		table := s.table.Load()
 		if table != nil && len(table.buckets) >= targetSize {
-			return
+			return s
 		}
 		if table == nil {
 			nt := &tableMutexStore{buckets: make([]unsafe.Pointer, targetSize)}
@@ -825,7 +829,7 @@ func (s *MutexStore[V]) Grow(maxIndex int64) {
 				if !s.newTable.CompareAndSwap(nil, nt) {
 					// Invariant: see bucketAlloc.
 				}
-				return
+				return s
 			}
 			continue
 		}
@@ -836,7 +840,7 @@ func (s *MutexStore[V]) Grow(maxIndex int64) {
 				if !s.table.CompareAndSwap(table, bigger) {
 					// Invariant: see bucketAlloc.
 				}
-				return
+				return s
 			}
 		}
 	}

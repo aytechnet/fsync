@@ -27,8 +27,11 @@ func NewSet[K comparable](estimatedItems int) *Set[K] {
 
 // Grow expands the underlying table so the set can hold at least
 // estimatedItems without triggering a rebuild. Same semantics as
-// Map.Grow.
-func (s *Set[K]) Grow(estimatedItems int) { s.m.Grow(estimatedItems) }
+// Map.Grow. Returns the receiver, so calls can be chained.
+func (s *Set[K]) Grow(estimatedItems int) *Set[K] {
+	s.m.Grow(estimatedItems)
+	return s
+}
 
 // Contains reports whether key is in the set.
 func (s *Set[K]) Contains(key K) bool {

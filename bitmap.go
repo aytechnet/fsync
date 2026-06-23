@@ -151,9 +151,11 @@ Retry:
 // words themselves. Same semantics as Store.Grow but with a
 // 512-bits-per-bucket shift (8 words × 64 bits). Calls with
 // maxIndex < s.start are a no-op.
-func (s *Bitmap) Grow(maxIndex int64) {
+//
+// Returns the receiver, so calls can be chained.
+func (s *Bitmap) Grow(maxIndex int64) *Bitmap {
 	if maxIndex < s.start {
-		return
+		return s
 	}
 	bucketIndex := uint(maxIndex-s.start) >> bitsPerBitmapBucketShift
 	targetSize := 1 << bits.Len64(uint64(bucketIndex))
@@ -164,7 +166,7 @@ func (s *Bitmap) Grow(maxIndex int64) {
 	for {
 		table := s.table.Load()
 		if table != nil && len(table.buckets) >= targetSize {
-			return
+			return s
 		}
 		if table == nil {
 			nt := &tableBitmap{buckets: make([]unsafe.Pointer, targetSize)}
@@ -172,7 +174,7 @@ func (s *Bitmap) Grow(maxIndex int64) {
 				if !s.newTable.CompareAndSwap(nil, nt) {
 					// Invariant: see Store.Grow.
 				}
-				return
+				return s
 			}
 			continue
 		}
@@ -183,7 +185,7 @@ func (s *Bitmap) Grow(maxIndex int64) {
 				if !s.table.CompareAndSwap(table, bigger) {
 					// Invariant: see Store.Grow.
 				}
-				return
+				return s
 			}
 		}
 	}
