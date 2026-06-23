@@ -5,45 +5,79 @@
 [![Go Coverage](https://img.shields.io/codecov/c/github/aytechnet/fsync/main?color=brightcolor)](https://codecov.io/gh/aytechnet/fsync)
 [![Go Report Card](https://goreportcard.com/badge/github.com/aytechnet/fsync)](https://goreportcard.com/report/github.com/aytechnet/fsync)
 
-`fsync` is a Go 1.25 library of high-performance concurrent containers
-built for the DyaPi iPaaS platform. It offers three primitives, each
-targeted at a different niche:
+`fsync` is a Go 1.25 library of high-performance, generic concurrent
+containers — drop-in replacements for `sync.Map`, `map[K]V + mutex`,
+buffered `chan`, and bitsets. Built for the DyaPi iPaaS platform; six
+containers, one set of guarantees: lock-free reads, zero-allocation
+hot paths, full `sync.Map`-compatible API, plus a stable `*V` pointer
+out of `Lock`.
+
+## At a glance
 
 | Type            | Key              | Value layout    | Niche                                  |
 |-----------------|------------------|-----------------|----------------------------------------|
+| `Map[K,V]`      | `K comparable`   | inline `[8]V`   | general concurrent hash map            |
+| `Set[K]`        | `K comparable`   | inline `[8]K`   | concurrent set-of-keys                 |
 | `Store[V]`      | `int64`          | inline `[32]V`  | dense integer-indexed store, lock-free |
 | `MutexStore[V]` | `int64`          | inline `[64]V`  | same, mutex per slot (contention)      |
-| `Map[K,V]`      | `K comparable`   | inline `[8]V`   | general concurrent hash map            |
-| `Set[K]`        | `K comparable`   | inline `[8]K`   | concurrent set-of-keys (zero-value V)  |
 | `Bitmap`        | `int64`          | `[8]atomic.Uint64` (512 bits / cacheline) | dense bit set (~10× lighter than `Store[bool]`) |
 | `Queue[T]`      | —                | inline `[64]T`  | unbounded MPMC FIFO, lock-free         |
 
-## What makes it different — `Lock` returns a stable `*V`
-
-The signature feature is that `Lock` pins a single entry and returns a
-**stable `*V` pointer** to the value stored *inline* in the container:
+## Quick start
 
 ```go
-p, cur, ok := m.Lock(key) // p is a pinned *V into the bucket itself
-*p++                       // mutate in place under exclusive ownership
-cur.Unlock()               // release the pin
+import "github.com/aytechnet/fsync"
+
+// Drop-in for sync.Map.
+var m fsync.Map[string, int]
+m.Store("hits", 1)
+v, ok := m.Load("hits") // 1, true
+
+// Lock returns a stable *V into the bucket — no allocation,
+// no *Entry indirection, no separate mutex needed.
+p, cur, _ := m.Lock("hits")
+*p++                    // mutate in place under exclusive ownership
+cur.Unlock()            // defer cur.Unlock() is the idiomatic pattern
+
+// Pre-size to skip warmup doublings; Grow is chainable.
+counters := fsync.NewMap[int, int64](0).Grow(100_000)
+
+// Bitmap: dense int64-indexed bit set, ~125 KB for 1M bits.
+var seen fsync.Bitmap
+seen.Set(42)
+seen.Has(42)            // true
+seen.Range(func(i int64) bool { /* … */ ; return true })
 ```
 
-This replaces the canonical Go pattern of "map of mutexed entries":
+## Why fsync?
 
-```go
-e, _ := m.LoadOrStore(key, &Entry{}) // one heap alloc per new key
-e.mu.Lock()
-e.v++                                 // chases a pointer
-e.mu.Unlock()
-```
+- **Lock(`*V`) without per-entry allocation.** The canonical
+  `map[K]*{mu, V}` pattern allocates an entry struct on every first
+  insert and chases a pointer on every access. `fsync.Map.Lock`
+  returns a stable `*V` straight into the inline bucket — no
+  `*Entry`, no allocation, on every key from the very first one.
+- **Speed.** `Load` at 0.75 ns (`Store`), 1.5 ns (`Map`); `Bitmap.Has`
+  at **0.5 ns** — the fastest concurrent lookup of any structure
+  benchmarked here. `Range` is 1.4–2.2 ns/key thanks to inline-bucket
+  layouts (one cacheline read per 8–64 entries).
+- **Memory.** Inline `[N]V` slots cost B/op only at the bucket
+  granularity. `Bitmap` packs 1 M bits in **~145 KB** (vs ~48 MB for
+  `xsync.Map[int64, bool]`); `Set` is a zero-runtime-cost wrapper
+  on `Map[K, struct{}]`. Detailed footprint table further down.
+- **`sync.Map`-compatible.** `LoadOrStore`, `Swap`, `CompareAndSwap`,
+  `CompareAndDelete`, `LoadAndDelete`, `Range`, `Clear`: same
+  signatures and semantics. Plus a runtime `Grow(n)` you don't get
+  from `sync.Map` or `xsync.Map` (chainable).
+- **Production-tested.** Backs the `aytechnet/dyapi` iPaaS platform
+  in production. 89 % test coverage, race-detector clean, A+ on Go
+  Report Card.
 
-In `fsync.Map` / `fsync.Store` / `fsync.MutexStore`, `V` lives in the
-bucket: no per-entry allocation, no `*Entry` indirection, and the
-pinned address survives rebuilds (the duplicate-on-pin policy keeps
-pinned buckets addressable in both old and new tables until released).
+For a per-container deep dive — concurrency contract, race-detector
+caveat with inline `V`, design history, and the full benchmark
+matrix — keep reading. For the API, see
+[pkg.go.dev/github.com/aytechnet/fsync](https://pkg.go.dev/github.com/aytechnet/fsync).
 
-### Concurrency contract
+## Concurrency contract
 
 For every key independently:
 
@@ -56,65 +90,10 @@ For every key independently:
 - **Always pair `Lock` with `Unlock`** — idiomatic usage is
   `defer cur.Unlock()` right after `Lock`.
 
-### Inline `V` vs heap `*entry`: the tradeoff with `-race`
-
-A point worth being explicit about, because it's the structural
-difference between `fsync.Map` and `xsync.Map` / `sync.Map`:
-
-- **`xsync.Map` (and stdlib `sync.Map`)** allocate a heap entry
-  per insert (`*entry{key, value}`). Once an entry is published,
-  it is **never mutated**: a Store creates a new `*entry` and CAS-es
-  the pointer over the old one (which becomes garbage). So a `Load`
-  reads the value field of a struct that is, from the moment of
-  publication, immutable. The Go race detector therefore **never
-  sees a write race** there, regardless of what `V` is. The price
-  is one heap allocation per first-time insert.
-
-- **`fsync.Map`** keeps `[8]V` inline in the bucket (no `*entry`,
-  no allocation on insert). The seqlock on `pins` makes the read
-  observably atomic *semantically*: a Load only returns a `V` it
-  observed between two pin-clear snapshots, so torn-reads under a
-  concurrent Lock holder are impossible. But the read is a plain
-  struct-field read, not an `atomic.Load` of a pointer — and the
-  Go runtime race detector does NOT understand the seqlock as a
-  synchronization primitive. So under `go test -race`, a `Load`
-  running concurrently with a `Store` / `Lock`+mutate on the same
-  slot may be **flagged as a data race even though the seqlock
-  guarantees the returned `V` is semantically valid**.
-
-  This is exactly what `TestMapLoadDuringLock` documents: that
-  test exists, uses the right semantics, but is compiled out under
-  `-race` via `//go:build !race` because the runtime would flag
-  the inline-`V` read.
-
-**What it means for the caller**:
-
-- If you use `fsync.Map` from production code (no `-race`), no
-  difference: the `V` returned by `Load` is correct, the seqlock
-  retries on Lock/Unlock cycles, and you pay zero allocation per
-  Store.
-- If you store a *complex* `V` like `map[X]Y` or `*Sub` and you
-  ever Lock + mutate the inner state, the race detector will
-  reliably catch your callers' downstream races on that inner
-  state — which is what you want. `fsync.Map` doesn't try to hide
-  that responsibility from you; it stays out of the way.
-- If your test suite runs `go test -race` AND you ever Store the
-  same key from two goroutines concurrently (a legitimate pattern),
-  expect the inline-V read in `Load` to occasionally surface in
-  the race report. The semantic guarantee holds; the report is a
-  consequence of the inline layout, not of a real torn read.
-
-The "no heap allocation" property is the entire point of inline
-`V` and the reason `Lock` can hand back a stable `*V`. If you want
-the alloc-and-immutable behaviour of `xsync.Map`, store a pointer:
-`fsync.Map[K, *Sub]` and your callers do `*p = newSub` themselves.
-You'd give back the zero-alloc-per-write but you'd get the
-race-detector silence in exchange.
-
 ### Full `sync.Map`-compatible surface
 
-On top of the pinning primitives, every structure ships the same set of
-atomic operations as `sync.Map`, with identical semantics:
+On top of the pinning primitives, every map / set / store ships the
+same set of atomic operations as `sync.Map`, with identical semantics:
 
 - `LoadOrStore(k, v) (actual V, loaded bool)` — get-or-insert, no pin.
 - `LoadAndDelete(k) (V, bool)` — atomic read+remove.
@@ -683,6 +662,63 @@ go test -bench=. -benchtime=2s -count=3 -run='^$' ./benchs/
 land below ~5 ns/op hit the cap before consuming the full
 `-benchtime` budget. To go past that cap, force the iteration count:
 `-benchtime=10000000000x`.
+
+## Implementation notes
+
+### Inline `V` vs heap `*entry`: the tradeoff with `-race`
+
+A point worth being explicit about, because it's the structural
+difference between `fsync.Map` and `xsync.Map` / `sync.Map`:
+
+- **`xsync.Map` (and stdlib `sync.Map`)** allocate a heap entry
+  per insert (`*entry{key, value}`). Once an entry is published,
+  it is **never mutated**: a Store creates a new `*entry` and CAS-es
+  the pointer over the old one (which becomes garbage). So a `Load`
+  reads the value field of a struct that is, from the moment of
+  publication, immutable. The Go race detector therefore **never
+  sees a write race** there, regardless of what `V` is. The price
+  is one heap allocation per first-time insert.
+
+- **`fsync.Map`** keeps `[8]V` inline in the bucket (no `*entry`,
+  no allocation on insert). The seqlock on `pins` makes the read
+  observably atomic *semantically*: a Load only returns a `V` it
+  observed between two pin-clear snapshots, so torn-reads under a
+  concurrent Lock holder are impossible. But the read is a plain
+  struct-field read, not an `atomic.Load` of a pointer — and the
+  Go runtime race detector does NOT understand the seqlock as a
+  synchronization primitive. So under `go test -race`, a `Load`
+  running concurrently with a `Store` / `Lock`+mutate on the same
+  slot may be **flagged as a data race even though the seqlock
+  guarantees the returned `V` is semantically valid**.
+
+  This is exactly what `TestMapLoadDuringLock` documents: that
+  test exists, uses the right semantics, but is compiled out under
+  `-race` via `//go:build !race` because the runtime would flag
+  the inline-`V` read.
+
+**What it means for the caller**:
+
+- If you use `fsync.Map` from production code (no `-race`), no
+  difference: the `V` returned by `Load` is correct, the seqlock
+  retries on Lock/Unlock cycles, and you pay zero allocation per
+  Store.
+- If you store a *complex* `V` like `map[X]Y` or `*Sub` and you
+  ever Lock + mutate the inner state, the race detector will
+  reliably catch your callers' downstream races on that inner
+  state — which is what you want. `fsync.Map` doesn't try to hide
+  that responsibility from you; it stays out of the way.
+- If your test suite runs `go test -race` AND you ever Store the
+  same key from two goroutines concurrently (a legitimate pattern),
+  expect the inline-V read in `Load` to occasionally surface in
+  the race report. The semantic guarantee holds; the report is a
+  consequence of the inline layout, not of a real torn read.
+
+The "no heap allocation" property is the entire point of inline
+`V` and the reason `Lock` can hand back a stable `*V`. If you want
+the alloc-and-immutable behaviour of `xsync.Map`, store a pointer:
+`fsync.Map[K, *Sub]` and your callers do `*p = newSub` themselves.
+You'd give back the zero-alloc-per-write but you'd get the
+race-detector silence in exchange.
 
 ## Design history & explored alternatives
 
