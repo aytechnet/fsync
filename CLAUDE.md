@@ -10,7 +10,7 @@ Six structures, six niches :
 | `Store[V]`      | `int64`          | `[32]V` + `lockused`       | index entier dense, lock-free          |
 | `MutexStore[V]` | `int64`          | `[64]V` + `[64]sync.Mutex` | idem, mutex par slot (contention forte) |
 | `Map[K,V]`      | `K comparable`   | `[8]V` par bucket           | hash map générique concurrente         |
-| `Set[K]`        | `K comparable`   | `[8]K` par bucket (`V=struct{}`) | wrapper typé sur `Map[K, struct{}]` |
+| `Set[K]`        | `K comparable`   | `[8]K` par bucket (sans `pins`, sans `values`) | spécialisation dédiée — ~13 % plus léger que `Map[K, struct{}]` |
 | `Bitmap`        | `int64`          | `[8]atomic.Uint64` (512 bits = 1 cacheline) | bit set dense, ~10× plus léger que `Store[bool]`, ~340× plus léger que `xsync.Map[int64, bool]` |
 | `Queue[T]`      | —                | `[64]T` par segment        | MPMC FIFO unbounded lock-free          |
 
@@ -26,7 +26,7 @@ rebuilds (politique « duplicate-on-pin » du Map). Remplace l'idiome canonique
 |----------------------------------|-------------------------------------------------|
 | `store.go`                       | `Store[V]` + `MutexStore[V]`                    |
 | `map.go`                         | `Map[K,V]` (le gros morceau, ~820 l.)            |
-| `set.go`                         | `Set[K]` — wrapper léger sur `Map[K, struct{}]` (~60 l.) |
+| `set.go`                         | `Set[K]` — spécialisation dédiée (~400 l.) avec son propre `bucketSet[K]` sans `pins` ni `values`, rebuild split-only (pas de duplicate-on-pin car pas de pin) |
 | `bitmap.go`                      | `Bitmap` — bit set int64-indexé (~300 l.), même mécanique `bucket / bucketAlloc / Grow` que `Store` mais bucket = `[8]atomic.Uint64` (512 bits = 1 cacheline, 8× moins d'objets heap qu'un bucket à 1 mot) |
 | `queue.go`                       | `Queue[T]` + `MutexQueue[T]` — MPMC FIFO unbounded |
 | `store_test.go`                  | tests séquentiels + concurrents de Store/MutexStore + `LockOrStore` |

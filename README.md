@@ -406,17 +406,20 @@ Highlights:
 
 ### `Set[K]` — concurrent set of comparable keys
 
-`Set[K]` is a typed wrapper over `Map[K, struct{}]`. In Go, `struct{}`
-has zero size, so the underlying bucket's value array `[8]struct{}`
-takes zero bytes — there is no memory penalty for the wrapper vs a
-dedicated bitmap-of-keys implementation, and method calls inline
-straight into the equivalent Map[K, struct{}] operation.
+`Set[K]` is a dedicated specialization (not a wrapper) with its own
+`bucketSet[K]` layout: 8 inline `K` slots, one `meta atomic.Uint64`
+packing 8 h7 tags, and a writer mutex. **No `pins` word, no
+`values` array, no seqlock pattern** — the key alone *is* the
+entry, and the meta tag scan + key compare is the entire Contains
+hot path. Compared to a `Map[K, struct{}]` wrapper, this drops 8
+bytes per bucket (the unused `pins` word) and shaves the seqlock
+overhead the generic Map carries to support `Lock(*V)`.
 
 API (zero value usable):
 
 ```go
-NewSet[K](estimatedItems int) *Set[K]
-(*Set[K]).Grow(estimatedItems int)
+NewSet[K]() *Set[K]
+(*Set[K]).Grow(estimatedItems int) *Set[K]
 (*Set[K]).Add(k K) (added bool)
 (*Set[K]).Contains(k K) bool
 (*Set[K]).Remove(k K) bool
@@ -432,23 +435,33 @@ Ryzen 5 8540U, 12 threads):
 |----------------------------|--------------------:|------------:|---------------------:|------------:|
 | `map[int]struct{}`+`Mutex` | (baseline workload) |      —      |                  —   |          —  |
 | `sync.Map` (stdlib)        | 109 ns / 2 allocs   |     2.77 ns |                  —   |          —  |
-| `xsync.Map[K, struct{}]`   | 59.6 ns / 1 alloc   | **1.06 ns** | 32.8 ns / **1 alloc**|     4.92 ns |
-| **`fsync.Set`**            | **59.0 ns / 0 alloc** | 1.46 ns   | **38.0 ns / 0 alloc**| **3.42 ns** |
-| `fsync.Map[K, struct{}]`   |     58.3 ns / 0 alloc |   1.49 ns |     35.6 ns / 0 alloc|         —  |
+| `xsync.Map[K, struct{}]`   | 78.8 ns / 1 alloc   | **1.01 ns** | 31.9 ns / **1 alloc**|     4.92 ns |
+| `fsync.Map[K, struct{}]`   | 58.9 ns / 0 alloc   | 1.57 ns     | 35.9 ns / 0 alloc    |         —   |
+| **`fsync.Set`**            | **55.7 ns / 0 alloc** | **1.45 ns** | **34.9 ns / 0 alloc**| **3.42 ns** |
+
+Footprint for 1M `int` keys (measured via `runtime.ReadMemStats`):
+
+| Implementation             | RAM       | per entry |
+|----------------------------|----------:|----------:|
+| `xsync.Map[int, struct{}]` |  47.9 MB  |    50 B   |
+| `fsync.Map[int, struct{}]` |  47.0 MB  |    49 B   |
+| **`fsync.Set[int]`**       | **40.8 MB** | **42 B**  |
 
 Readings:
 
-- **Wrapper overhead = 0.** `fsync.Set` is within ~1 % of
-  `fsync.Map[K, struct{}]` on every workload — the compiler inlines
-  the wrapper away and `struct{}` doesn't take space. So you get a
-  cleaner API at zero cost.
-- **vs `xsync.Map[K, struct{}]`:** parity on Add throughput (59 vs
-  60 ns) but `fsync.Set` saves **1 alloc per insert**. `Contains`
-  is ~40 % slower (the pin-word read overhead, same gap as on
-  `Map.Load`). `Range/key` is **~1.4× faster** (3.42 vs 4.92 ns)
-  thanks to the inline `[8]K` bucket layout.
+- **vs `fsync.Map[K, struct{}]`:** Set is ~5 % faster on Add,
+  ~8 % faster on Contains, **13 % less RAM** (no `pins` word in
+  the bucket). The specialization is small but real — Map's
+  seqlock and pin word are dead weight in the Set use case.
+- **vs `xsync.Map[K, struct{}]`:** Set saves **1 alloc per
+  insert** (Add 56 vs 79 ns) and is 15 % lighter on RAM. xsync
+  still wins Contains (1.01 vs 1.45 ns) thanks to a tighter
+  bucket layout with no state-check on the hot path.
 - **vs `sync.Map`:** ~2× faster on Add, with 2 allocs/op cut to 0;
   ~2× faster on Contains.
+- **Range/key at 3.42 ns** is **1.4× faster than `xsync.Map`**
+  (4.92 ns) thanks to the inline `[8]K` bucket layout — one
+  cacheline read per 8 keys.
 
 When to pick which: use `fsync.Set` whenever you'd otherwise write
 `map[K]struct{}` + a mutex, or `sync.Map` with `struct{}{}` values.
