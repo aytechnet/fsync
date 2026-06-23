@@ -15,7 +15,7 @@ targeted at a different niche:
 | `MutexStore[V]` | `int64`          | inline `[64]V`  | same, mutex per slot (contention)      |
 | `Map[K,V]`      | `K comparable`   | inline `[8]V`   | general concurrent hash map            |
 | `Set[K]`        | `K comparable`   | inline `[8]K`   | concurrent set-of-keys (zero-value V)  |
-| `Bitmap`        | `int64`          | 64 bits/bucket  | dense bit set (~10× lighter than `Store[bool]`) |
+| `Bitmap`        | `int64`          | `[8]atomic.Uint64` (512 bits / cacheline) | dense bit set (~10× lighter than `Store[bool]`) |
 | `Queue[T]`      | —                | inline `[64]T`  | unbounded MPMC FIFO, lock-free         |
 
 ## What makes it different — `Lock` returns a stable `*V`
@@ -480,12 +480,14 @@ ints and the 0.4 ns gap on `Contains` is the bottleneck. Use plain
 ### `Bitmap` — dense bit set on `int64` indexes
 
 `Bitmap` is the specialized version of `Store[bool]`: each bucket
-packs **64 bits in a single `atomic.Uint64`** word, with no
-`values` array at all. The per-bit memory cost drops from ~1.25
-bytes (`Store[bool]`: `[32]bool` + a `lockused` word per 32 bits)
-to **0.125 byte** — a **10× win on steady-state memory**, with
-faster reads as a bonus (one atomic Load and one bitmask, no pin
-pattern).
+packs **8 `atomic.Uint64` words = 512 bits = exactly one cacheline**
+(64 bytes), with no `values` array at all. The per-bit memory cost
+drops from ~1.25 bytes (`Store[bool]`: `[32]bool` + a `lockused`
+word per 32 bits) to ~0.13 byte — a **~10× win on steady-state
+memory**, with **8× fewer heap objects** for the same index range
+(one bucket covers 512 bits instead of 64). Reads and writes are
+each one atomic op on the bucket word selected by 3 bits of the
+index, plus a single bitmask — no pin pattern, no values[] write.
 
 The constructor takes a `start int64` like `Store`: `Bitmap.Set(i)`
 addresses absolute slot `i - start`, and calls with `i < start` are
@@ -516,48 +518,51 @@ same Ryzen 5 8540U, 12 threads):
 | `map[int64]bool` + `sync.Mutex` | 195 ns               |     26.3 ns  |                  —   |          —  |
 | `xsync.Map[int64, bool]` v4     | 52.9 ns / **1 alloc**|     1.02 ns  | 32.6 ns / **1 alloc**|     5.09 ns |
 | `fsync.Store[bool]`             | 14.7 ns / 0 alloc    |     2.88 ns  |  **6.6 ns / 0 alloc**|     1.60 ns |
-| **`fsync.Bitmap`**              | **5.0 ns / 0 alloc** | **0.43 ns**  |     19.0 ns / 0 alloc| **1.44 ns** |
+| **`fsync.Bitmap`**              | **1.6 ns / 0 alloc** | **0.53 ns**  |     23.6 ns / 0 alloc| **1.51 ns** |
 
 Readings:
 
-- **`Has` at 0.43 ns/op is the fastest lookup of the whole package**:
-  6.5× faster than `Store[bool].Load` (2.88 ns) and 2.4× faster than
+- **`Has` at 0.53 ns/op** is the fastest lookup of the whole package:
+  ~5× faster than `Store[bool].Load` (2.88 ns) and 2× faster than
   `xsync.Map.Load` (1.02 ns). A single `Uint64.Load` + bitmask, no
   pin-word, no per-slot indirection.
-- **`Set` at 5.0 ns** is 3× faster than `Store[bool].Store` (14.7 ns)
-  and 11× faster than `xsync.Map.Store` (52.9 ns). One atomic `Or`
-  on the bucket word — the bit *is* the value, no values[] write
-  follows.
-- **`Range/key` at 1.44 ns** is the package record. Iteration uses
+- **`Set` at 1.6 ns** is **9× faster** than `Store[bool].Store`
+  (14.7 ns) and **33× faster** than `xsync.Map.Store` (52.9 ns).
+  One atomic `Or` on the chosen word in the bucket; write-coalescing
+  on a hot cacheline as a side-benefit of the 8-word bucket.
+- **`Range/key` at 1.51 ns** is the package record. Iteration uses
   `bits.TrailingZeros64` to walk only set bits within each bucket
   word — no per-slot scan.
 - **`Set+Unset` (rolling window of 1024 indexes) is the one
-  weakness**: 19.0 ns vs `Store[bool]`'s 6.6 ns. With 64 slots per
-  bucket, the rolling window concentrates pressure on just 16
-  cachelines (vs 32 for Store's 32-slot buckets), so the cacheline
+  weakness**: 23.6 ns vs `Store[bool]`'s 6.6 ns. With 512 bits per
+  bucket the rolling window concentrates pressure on just 2 buckets
+  (vs 32 for `Store[bool]`'s 32-slot buckets), so the cacheline
   ping-pong between 12 cores hits harder. On *non-contended* writes
   (distinct keys per worker), Bitmap stays well ahead.
 
-Memory footprint comparison (heap delta measured via
-`runtime.ReadMemStats` after inserting 1M distinct indexes from a
-single goroutine, GC forced before and after):
+Memory footprint comparison (heap delta and live `HeapObjects`
+measured via `runtime.ReadMemStats` after inserting 1M distinct
+indexes from a single goroutine, GC forced before and after):
 
-| Implementation                  | RAM for 1M bits | per entry |
-|---------------------------------|----------------:|----------:|
-| `map[int64]bool` + `sync.Mutex` |        36.1 MB  |     37 B  |
-| `xsync.Map[int64, bool]`        |        47.8 MB  |     50 B  |
-| `fsync.Map[int64, bool]`        |        47.0 MB  |     49 B  |
-| `fsync.Store[bool]`             |         1.7 MB  |      1 B  |
-| **`fsync.Bitmap`**              |    **0.24 MB**  |   **0 B** (~0.25) |
+| Implementation                  | RAM for 1M bits | Heap objects | per entry |
+|---------------------------------|----------------:|-------------:|----------:|
+| `map[int64]bool` + `sync.Mutex` |        36.1 MB  |        4 121 |     37 B  |
+| `xsync.Map[int64, bool]`        |        48.0 MB  |    1 011 074 |     50 B  |
+| `fsync.Map[int64, bool]`        |        47.0 MB  |      412 288 |     49 B  |
+| `fsync.Store[bool]`             |         1.7 MB  |       31 254 |      1 B  |
+| **`fsync.Bitmap`**              |    **0.14 MB**  |    **1 958** |   **~0 B** (~0.13) |
 
 `fsync.Map[int64, bool]` and `xsync.Map[int64, bool]` land within
-~2 % of each other: both pay for hashed-bucket overhead (tags, pin
-words, per-bucket sync primitives) that dwarfs the 1-byte `bool`
-payload. `fsync.Store[bool]` skips hashing entirely and packs 32
-bools per bucket alongside a single `lockused` word — already a
-**~30× win**. `Bitmap` packs 64 bits per `atomic.Uint64`, no values
-array — another **~7× win on top of `Store[bool]`** and **~200×
-smaller than the hashed maps**.
+~2 % of each other on RAM but the hashed maps both leak heap
+objects by the hundreds of thousands (one per inserted entry) —
+that's the GC-mark cost the inline-bucket designs sidestep.
+`fsync.Store[bool]` skips hashing and packs 32 bools per
+bucket — already **~30× less RAM** and **~30× fewer objects**.
+`Bitmap` then packs 512 bits per cacheline-aligned bucket, no
+values array — another **~12× win on top of `Store[bool]`** and
+**~340× smaller than the hashed maps**, with only **~2 000 heap
+objects** for 1M bits (a 500× reduction vs the hashed maps'
+~500k+ objects to scan on every GC cycle).
 
 When to pick which: use `Bitmap` whenever the workload reduces to
 "is index `i` set/unset" on a dense or sparse `int64` domain

@@ -7,12 +7,14 @@ import (
 )
 
 // Bitmap is a lock-free concurrent bit set indexed by int64. Each
-// bucket packs 64 bits in a single atomic.Uint64 word, so the per-
-// entry memory cost is 1 bit (0.125 byte) plus the bucket pointer
-// table overhead amortized across 64 entries. By comparison Store[bool]
-// would carry ~1.25 bytes per entry (`[32]bool` + a `lockused` word
-// per 32 entries), so Bitmap is roughly **10× smaller** at steady
-// state.
+// bucket packs **8 atomic.Uint64 words = 512 bits = exactly one
+// cacheline** (64 bytes). Compared to a one-word-per-bucket layout,
+// this consolidates 8× fewer heap objects for the same index range,
+// which both lightens GC pressure (fewer pointers in the bucket
+// table, fewer objects to scan) and improves locality (neighbouring
+// bits share the same cacheline). The per-bit memory cost stays
+// around 0.13 byte at steady state; by comparison Store[bool] would
+// carry ~1.25 bytes per entry, so Bitmap is roughly **10× smaller**.
 //
 // Indexes are interpreted as offsets from `start` (Bitmap.Set(i)
 // targets absolute slot `i - start`); calls with `i < start` are
@@ -20,21 +22,30 @@ import (
 // to 0).
 //
 // Bitmap has no Lock(*V) API: a pointer to a single bit does not
-// exist, and Set / Unset / Has are already lock-free single-atomic
-// operations against the bucket word.
+// exist, and Set / Unset / Has / Toggle are already lock-free
+// single-atomic operations against one of the bucket's 8 words.
 type Bitmap struct {
 	start    int64
 	table    atomic.Pointer[tableBitmap]
 	newTable atomic.Pointer[tableBitmap]
 }
 
+// bucketBitmap packs 8 atomic.Uint64 words (512 bits) into a single
+// heap object. The 8 words also fit a single 64-byte cacheline on
+// every mainstream CPU.
 type bucketBitmap struct {
-	used atomic.Uint64
+	words [8]atomic.Uint64
 }
 
 type tableBitmap struct {
 	buckets []unsafe.Pointer
 }
+
+// bitsPerBitmapBucket is 512 (8 words × 64 bits). It is the unit
+// the bucket-table shift uses (>> 9). The intra-bucket selectors
+// derive from the low 9 bits of the normalized index: bits [6..8]
+// pick the word (0..7), bits [0..5] pick the bit (0..63).
+const bitsPerBitmapBucketShift = 9
 
 // NewBitmap returns an empty Bitmap whose indexes are interpreted as
 // offsets from start. The zero-value Bitmap is equally usable.
@@ -50,7 +61,7 @@ func (s *Bitmap) bucket(i int64) (b *bucketBitmap, index uint) {
 		return
 	}
 	index = uint(i - s.start)
-	bucketIndex := index >> 6
+	bucketIndex := index >> bitsPerBitmapBucketShift
 	if table := s.table.Load(); table != nil {
 		if bucketIndex < uint(len(table.buckets)) {
 			b = (*bucketBitmap)(atomic.LoadPointer(&table.buckets[bucketIndex]))
@@ -68,7 +79,7 @@ func (s *Bitmap) bucketAlloc(i int64) (b *bucketBitmap, index uint) {
 		return
 	}
 	index = uint(i - s.start)
-	bucketIndex := index >> 6
+	bucketIndex := index >> bitsPerBitmapBucketShift
 
 Retry:
 
@@ -138,13 +149,13 @@ Retry:
 // Grow ensures the bucket-pointer table has room for up to maxIndex
 // (inclusive), without allocating any of the underlying bucket
 // words themselves. Same semantics as Store.Grow but with a
-// 64-bits-per-bucket shift. Calls with maxIndex < s.start are a
-// no-op.
+// 512-bits-per-bucket shift (8 words × 64 bits). Calls with
+// maxIndex < s.start are a no-op.
 func (s *Bitmap) Grow(maxIndex int64) {
 	if maxIndex < s.start {
 		return
 	}
-	bucketIndex := uint(maxIndex-s.start) >> 6
+	bucketIndex := uint(maxIndex-s.start) >> bitsPerBitmapBucketShift
 	targetSize := 1 << bits.Len64(uint64(bucketIndex))
 	if targetSize < 32 {
 		targetSize = 32
@@ -181,7 +192,7 @@ func (s *Bitmap) Grow(maxIndex int64) {
 // Has reports whether the bit at index i is set.
 func (s *Bitmap) Has(i int64) bool {
 	if b, idx := s.bucket(i); b != nil {
-		return b.used.Load()&(uint64(1)<<(idx&63)) != 0
+		return b.words[(idx>>6)&7].Load()&(uint64(1)<<(idx&63)) != 0
 	}
 	return false
 }
@@ -191,7 +202,7 @@ func (s *Bitmap) Has(i int64) bool {
 func (s *Bitmap) Set(i int64) (added bool) {
 	if b, idx := s.bucketAlloc(i); b != nil {
 		mask := uint64(1) << (idx & 63)
-		return b.used.Or(mask)&mask == 0
+		return b.words[(idx>>6)&7].Or(mask)&mask == 0
 	}
 	return false
 }
@@ -201,7 +212,7 @@ func (s *Bitmap) Set(i int64) (added bool) {
 func (s *Bitmap) Unset(i int64) (removed bool) {
 	if b, idx := s.bucket(i); b != nil {
 		mask := uint64(1) << (idx & 63)
-		return b.used.And(^mask)&mask != 0
+		return b.words[(idx>>6)&7].And(^mask)&mask != 0
 	}
 	return false
 }
@@ -209,16 +220,17 @@ func (s *Bitmap) Unset(i int64) (removed bool) {
 // Toggle flips the bit at index i and returns the new state (true =
 // set after the call). The bucket is allocated if missing.
 //
-// Implementation: a tiny CAS loop on the bucket word (atomic.Uint64
+// Implementation: a tiny CAS loop on the target word (atomic.Uint64
 // has Or/And but not Xor as of Go 1.25). The retry path runs only
 // on a lost CAS, which is rare in practice — a single concurrent
-// Set/Unset/Toggle on this 64-bit window has to win the same word.
+// Set/Unset/Toggle on the same word has to win the race.
 func (s *Bitmap) Toggle(i int64) (nowSet bool) {
 	if b, idx := s.bucketAlloc(i); b != nil {
+		w := &b.words[(idx>>6)&7]
 		mask := uint64(1) << (idx & 63)
 		for {
-			cur := b.used.Load()
-			if b.used.CompareAndSwap(cur, cur^mask) {
+			cur := w.Load()
+			if w.CompareAndSwap(cur, cur^mask) {
 				return cur&mask == 0
 			}
 		}
@@ -233,7 +245,9 @@ func (s *Bitmap) Len() (count int) {
 	if table := s.table.Load(); table != nil {
 		for i := range table.buckets {
 			if b := (*bucketBitmap)(atomic.LoadPointer(&table.buckets[i])); b != nil {
-				count += bits.OnesCount64(b.used.Load())
+				for w := range b.words {
+					count += bits.OnesCount64(b.words[w].Load())
+				}
 			}
 		}
 	}
@@ -254,14 +268,17 @@ func (s *Bitmap) Range(f func(i int64) bool) {
 		if b == nil {
 			continue
 		}
-		w := b.used.Load()
-		base := s.start + int64(bIdx)<<6
-		for w != 0 {
-			j := bits.TrailingZeros64(w)
-			if !f(base + int64(j)) {
-				return
+		bucketBase := s.start + int64(bIdx)<<bitsPerBitmapBucketShift
+		for w := range b.words {
+			word := b.words[w].Load()
+			wordBase := bucketBase + int64(w)<<6
+			for word != 0 {
+				j := bits.TrailingZeros64(word)
+				if !f(wordBase + int64(j)) {
+					return
+				}
+				word &= word - 1
 			}
-			w &= w - 1
 		}
 	}
 }
@@ -272,7 +289,9 @@ func (s *Bitmap) Clear() {
 	if table := s.table.Load(); table != nil {
 		for i := range table.buckets {
 			if b := (*bucketBitmap)(atomic.LoadPointer(&table.buckets[i])); b != nil {
-				b.used.Store(0)
+				for w := range b.words {
+					b.words[w].Store(0)
+				}
 			}
 		}
 	}

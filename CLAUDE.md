@@ -11,7 +11,7 @@ Six structures, six niches :
 | `MutexStore[V]` | `int64`          | `[64]V` + `[64]sync.Mutex` | idem, mutex par slot (contention forte) |
 | `Map[K,V]`      | `K comparable`   | `[8]V` par bucket           | hash map générique concurrente         |
 | `Set[K]`        | `K comparable`   | `[8]K` par bucket (`V=struct{}`) | wrapper typé sur `Map[K, struct{}]` |
-| `Bitmap`        | `int64`          | 64 bits/bucket (`atomic.Uint64`) | bit set dense, ~10× plus léger que `Store[bool]` |
+| `Bitmap`        | `int64`          | `[8]atomic.Uint64` (512 bits = 1 cacheline) | bit set dense, ~10× plus léger que `Store[bool]`, ~340× plus léger que `xsync.Map[int64, bool]` |
 | `Queue[T]`      | —                | `[64]T` par segment        | MPMC FIFO unbounded lock-free          |
 
 Différenciateur central : **`Lock(k)` renvoie un `*V` stable** vers la valeur
@@ -27,7 +27,7 @@ rebuilds (politique « duplicate-on-pin » du Map). Remplace l'idiome canonique
 | `store.go`                       | `Store[V]` + `MutexStore[V]`                    |
 | `map.go`                         | `Map[K,V]` (le gros morceau, ~820 l.)            |
 | `set.go`                         | `Set[K]` — wrapper léger sur `Map[K, struct{}]` (~60 l.) |
-| `bitmap.go`                      | `Bitmap` — bit set int64-indexé (~280 l.), même mécanique `bucket / bucketAlloc / Grow` que `Store` mais bucket = 1 `atomic.Uint64` |
+| `bitmap.go`                      | `Bitmap` — bit set int64-indexé (~300 l.), même mécanique `bucket / bucketAlloc / Grow` que `Store` mais bucket = `[8]atomic.Uint64` (512 bits = 1 cacheline, 8× moins d'objets heap qu'un bucket à 1 mot) |
 | `queue.go`                       | `Queue[T]` + `MutexQueue[T]` — MPMC FIFO unbounded |
 | `store_test.go`                  | tests séquentiels + concurrents de Store/MutexStore + `LockOrStore` |
 | `map_test.go`, `map_concur_test.go` | tests `Map` (séquentiel, rebuild, pins, concurrent) |
