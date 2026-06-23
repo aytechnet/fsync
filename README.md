@@ -56,10 +56,10 @@ seen.Range(func(i int64) bool { /* … */ ; return true })
   insert and chases a pointer on every access. `fsync.Map.Lock`
   returns a stable `*V` straight into the inline bucket — no
   `*Entry`, no allocation, on every key from the very first one.
-- **Speed.** `Load` at 0.75 ns (`Store`), 1.5 ns (`Map`); `Bitmap.Has`
-  at **0.5 ns** — the fastest concurrent lookup of any structure
-  benchmarked here. `Range` is 1.4–2.2 ns/key thanks to inline-bucket
-  layouts (one cacheline read per 8–64 entries).
+- **Speed.** `Load` at 0.82 ns (`Store`), 1.40 ns (`Map`);
+  `Bitmap.Has` at **0.52 ns** — the fastest concurrent lookup of
+  any structure benchmarked here. `Range` is 1.5–2.6 ns/key thanks
+  to inline-bucket layouts (one cacheline read per 8–64 entries).
 - **Memory.** Inline `[N]V` slots cost B/op only at the bucket
   granularity. `Bitmap` packs 1 M bits in **~145 KB** (vs ~48 MB for
   `xsync.Map[int64, bool]`); `Set` is a zero-runtime-cost wrapper
@@ -107,10 +107,12 @@ same set of atomic operations as `sync.Map`, with identical semantics:
 
 Go 1.25, AMD Ryzen 5 8540U (Zen 4, 6c/12t), GOMAXPROCS=12, all benches
 in `./benchs/`. Numbers below are medians of 3 runs at `-benchtime=5s
--count=3`, **except `sync.Map` and `xsync.Map` rows which use
-`-benchtime=2s -count=3`** (avoids OOM on `BenchmarkSyncMapStore` —
-each insertion boxes an `int` interface, so at 5 s × 3 × 12 goroutines
-the live set tops 10 GB). Lower is better.
+-count=3` for fsync rows and `-benchtime=2s -count=3` for `sync.Map`
+and `xsync.Map`. The `Store` and `GrowStore` rows use a shorter
+`-benchtime=1s` (fsync) or `-benchtime=500ms` (sync.Map / xsync.Map)
+to avoid OOM on a 14 GB machine — each `sync.Map.Store` insertion
+boxes an `int` into an interface, so the live set climbs into the
+tens of GB at higher b.N. Lower is better.
 
 Workloads:
 
@@ -136,46 +138,48 @@ B/op + allocs/op are the inline-`V` design's whole point.
 
 | Implementation                       | ReadOnly    | ReadHeavy   | Store        | GrowStore    | Churn        | LoadOrStore | Range/key   |
 |--------------------------------------|------------:|------------:|-------------:|-------------:|-------------:|------------:|------------:|
-| `map[int]int` (no lock, baseline)    |     1.39 ns | data race   |          —   |          —   |          —   |          —  |          —  |
-| `map[int]int` + `sync.Mutex`         |           — |     45.0 ns |       222 ns |          —   |      57.4 ns |          —  |          —  |
-| `map[int]int` + `sync.RWMutex`       |           — |     20.9 ns |       246 ns |          —   |      60.6 ns |          —  |          —  |
-| `sync.Map` (stdlib)                  |     3.09 ns |     8.97 ns |       118 ns |          —   |      88.3 ns |    10.33 ns |     4.99 ns |
-| `xsync.Map` v4                       |     1.03 ns |     3.38 ns |      89.2 ns |      95.2 ns |      15.4 ns |     1.35 ns |     4.37 ns |
-| **`fsync.Map`**                      | **1.56 ns** | **6.06 ns** |  **74.4 ns** |  **73.0 ns** |  **18.0 ns** | **1.59 ns** | **2.21 ns** |
-| **`fsync.Store`**                    | **0.75 ns** | **0.95 ns** |  **3.47 ns** |          —   |  **2.18 ns** | **1.10 ns** | **1.42 ns** |
-| **`fsync.MutexStore`**               |     1.04 ns |     1.14 ns |      3.15 ns |          —   |      3.12 ns |     1.19 ns |     3.69 ns |
+| `map[int]int` (no lock, baseline)    |     2.11 ns | data race   |          —   |          —   |          —   |          —  |          —  |
+| `map[int]int` + `sync.Mutex`         |           — |     45.5 ns |       218 ns |          —   |      58.0 ns |          —  |          —  |
+| `map[int]int` + `sync.RWMutex`       |           — |     19.9 ns |       238 ns |          —   |      61.8 ns |          —  |          —  |
+| `sync.Map` (stdlib)                  |     2.95 ns |     8.42 ns |      95.1 ns |          —   |      82.9 ns |    10.08 ns |     5.16 ns |
+| `xsync.Map` v4                       |     1.04 ns |     3.56 ns |      74.5 ns |      70.9 ns |     14.96 ns |     1.38 ns |     4.52 ns |
+| **`fsync.Map`**                      | **1.40 ns** | **5.91 ns** |  **74.2 ns** |  **65.3 ns** |  **17.62 ns**| **1.54 ns** | **2.61 ns** |
+| **`fsync.Store`**                    | **0.82 ns** | **1.19 ns** |  **3.46 ns** |  **3.34 ns** |  **2.30 ns** | **1.17 ns** | **1.50 ns** |
+| **`fsync.MutexStore`**               |     0.97 ns |     1.22 ns |      3.05 ns |          —   |      3.22 ns |     1.22 ns |     3.72 ns |
 
 `Store` and `MutexStore` use a dense `int64` key and skip hashing
 entirely — that's where the order-of-magnitude jump on `Store`
-(3.47 vs 74.4 ns) and `Churn` (2.18 vs 18.0 ns) comes from. Treat
+(3.46 vs 74.2 ns) and `Churn` (2.30 vs 17.6 ns) comes from. Treat
 their rows as "the cost of the same workload once the key happens
 to be a dense integer".
 
 Highlights:
 
-- `fsync.Map.LoadOrStore` at **1.59 ns** is **6.5× faster than
-  `sync.Map` (10.33 ns)** on the hot get-or-set path, and within ~18 %
-  of `xsync.Map` (1.35 ns) — drop-in replacement parity.
-- `fsync.Map.Range/key` at **2.21 ns** is the **fastest iterator**
-  among hashed maps: 2.3× faster than `sync.Map` (4.99 ns) and 2.0×
-  faster than `xsync.Map` (4.37 ns), thanks to the inline `[8]V`
-  bucket layout (one cacheline read per 8 entries). `fsync.Store`
-  goes further still at **1.42 ns/entry** with its `[32]V` slots.
-- `fsync.Map` Load (1.56 ns) sits between a plain `map[int]int`
-  (1.39 ns) and `sync.Map` (3.09 ns) — ~12 % overhead vs the
-  lockless baseline buys full concurrent safety AND `Lock(*V)`
-  semantics. `xsync.Map` (1.03 ns) edges everyone on Load thanks
+- `fsync.Map.LoadOrStore` at **1.54 ns** is **6.5× faster than
+  `sync.Map` (10.08 ns)** on the hot get-or-set path, and within
+  ~12 % of `xsync.Map` (1.38 ns) — drop-in replacement parity.
+- `fsync.Map.Range/key` at **2.61 ns** is the **fastest iterator**
+  among hashed maps: 2.0× faster than `sync.Map` (5.16 ns) and
+  ~1.7× faster than `xsync.Map` (4.52 ns), thanks to the inline
+  `[8]V` bucket layout (one cacheline read per 8 entries).
+  `fsync.Store` goes further still at **1.50 ns/entry** with its
+  `[32]V` slots.
+- `fsync.Map` Load (1.40 ns) sits below a plain `map[int]int`
+  (2.11 ns under `RunParallel` with false-sharing on shared
+  buckets) and well below `sync.Map` (2.95 ns) — full concurrent
+  safety AND `Lock(*V)` semantics for less than the lockless
+  baseline. `xsync.Map` (1.04 ns) edges everyone on Load thanks
   to its tighter bucket layout (no pin-word to read).
-- `fsync.Store.ReadOnly` at **0.75 ns** is the fastest concurrent
-  Load benchmarked here — it beats `xsync.Map` (1.03 ns) because
+- `fsync.Store.ReadOnly` at **0.82 ns** is the fastest concurrent
+  Load benchmarked here — it beats `xsync.Map` (1.04 ns) because
   integer-indexed slots skip hashing entirely.
-- `GrowStore` on `fsync.Map` is within 2 % of `Store` (no Grow):
+- `GrowStore` on `fsync.Map` is within 12 % of `Store` (no Grow):
   the table is allocated up-front so concurrent Stores no longer
   race on rebuild. `xsync.WithPresize` shows similar behavior but
   with higher run-to-run variance.
-- `Churn` (rolling window Store+Delete) is where `xsync.Map` (15.4
-  ns) shines vs `fsync.Map` (18.0 ns). Both crush stdlib maps with
-  locks (~60 ns) and `sync.Map` (88.3 ns).
+- `Churn` (rolling window Store+Delete) is where `xsync.Map`
+  (14.96 ns) shines vs `fsync.Map` (17.62 ns). Both crush stdlib
+  maps with locks (~60 ns) and `sync.Map` (82.9 ns).
 - On Store vs MutexStore: `Store` wins on Load/Churn/LoadOrStore
   (lock-free bit-spin), `MutexStore` wins on raw Store throughput
   (~9 % faster — futex is cheaper than the bit-spin for write-heavy
@@ -190,9 +194,9 @@ steady-state `LoadOrStore`, and the per-entry locking pattern.
 
 | Implementation                       | Store                | LoadOrStore     | Lock + inc¹                     |
 |--------------------------------------|---------------------:|----------------:|--------------------------------:|
-| `sync.Map` (stdlib)                  |  126 B / 3 allocs    | 14 B / 1 alloc  | 16 B / 1 alloc (first insert)   |
+| `sync.Map` (stdlib)                  |  117 B / 3 allocs    | 14 B / 1 alloc  | 16 B / 1 alloc (first insert)   |
 | `xsync.Map` v4                       |   84 B / 1 alloc     |  0 B / 0 allocs | 16 B / 1 alloc (first insert)   |
-| **`fsync.Map`**                      | **83 B / 0 allocs**ᵃ |  **0 B / 0 allocs** | **0 B / 0 allocs**          |
+| **`fsync.Map`**                      | **88 B / 0 allocs**ᵃ |  **0 B / 0 allocs** | **0 B / 0 allocs**          |
 | **`fsync.Store`**                    |  **1 B / 0 allocs**ᵃ |  **0 B / 0 allocs** | **0 B / 0 allocs**          |
 | **`fsync.MutexStore`**               |  **2 B / 0 allocs**ᵃ |  **0 B / 0 allocs** | **0 B / 0 allocs**          |
 
@@ -232,15 +236,15 @@ contention. We report three regimes:
 | Implementation                                                  | Moderate    | Uncontended | Single-key   |
 |-----------------------------------------------------------------|------------:|------------:|-------------:|
 | `sync.Map[int, *{Mutex, int}]` — `Load` then take mutex         |     3.81 ns |          —  |           —  |
-| `sync.Map[int, *{Mutex, int}]` — first insert (allocates entry) |    10.06 ns |          —  |           —  |
+| `sync.Map[int, *{Mutex, int}]` — first insert (allocates entry) |     9.35 ns |          —  |           —  |
 | `xsync.Map[int, *{Mutex, int}]` — `Load` then take mutex        |     2.16 ns |          —  |           —  |
-| `xsync.Map[int, *{Mutex, int}]` — first insert (allocates entry)|     7.99 ns |          —  |           —  |
-| **`fsync.Map.Lock` + `*p++` + `Unlock`**                        | **7.65 ns** | **3.62 ns** |          —  |
-| **`fsync.Map.LockOrStore` + `*p++` + `Unlock`**                 | **8.80 ns** |          —  |           —  |
-| **`fsync.Store.Lock` + `*p++` + `Unlock`**                      | **15.1 ns** | **1.05 ns** | **12.9 ns** |
-| **`fsync.Store.LockOrStore` + `*p++` + `Unlock`**               | **19.5 ns** | **1.44 ns** | **16.3 ns** |
-| **`fsync.MutexStore.Lock` + `*p++` + `Unlock`**                 | **5.54 ns** | **1.20 ns** | **51.5 ns** |
-| **`fsync.MutexStore.LockOrStore` + `*p++` + `Unlock`**          | **5.81 ns** |          —  |           —  |
+| `xsync.Map[int, *{Mutex, int}]` — first insert (allocates entry)|     7.60 ns |          —  |           —  |
+| **`fsync.Map.Lock` + `*p++` + `Unlock`**                        | **7.95 ns** | **3.77 ns** |          —  |
+| **`fsync.Map.LockOrStore` + `*p++` + `Unlock`**                 | **8.56 ns** |          —  |           —  |
+| **`fsync.Store.Lock` + `*p++` + `Unlock`**                      | **15.65 ns**| **1.07 ns** | **12.68 ns**|
+| **`fsync.Store.LockOrStore` + `*p++` + `Unlock`**               | **19.37 ns**| **1.41 ns** | **15.90 ns**|
+| **`fsync.MutexStore.Lock` + `*p++` + `Unlock`**                 | **5.11 ns** | **1.18 ns** | **51.00 ns**|
+| **`fsync.MutexStore.LockOrStore` + `*p++` + `Unlock`**          | **5.24 ns** |          —  |           —  |
 
 Notes:
 
@@ -251,33 +255,34 @@ Notes:
   `map[K]*{mu, V}` pattern is warm and no new entries get inserted,
   `xsync.Map[*{mu,v}].Load + e.mu.Lock + e.v++ + e.mu.Unlock`
   (**2.16 ns** here) **beats `fsync.Map.Lock + *p++ + Unlock`
-  (7.65 ns)** by 3.5×. The reasons are real: xsync's Load has no
+  (7.95 ns)** by 3.7×. The reasons are real: xsync's Load has no
   pin-word to read, and a pointer-load + sync.Mutex.Lock on an
   uncontended mutex compiles into very few atomics on Zen 4. The
   trade-off is one heap allocation per first-time key on the xsync
   path, plus the indirection on every access. `fsync.Map.Lock`
-  earns its 7.65 ns by giving you a stable `*V` directly into the
+  earns its 7.95 ns by giving you a stable `*V` directly into the
   bucket, no `*Entry`, no allocation, and the same Lock semantics
   the moment the key is first seen.
-- **Single-key:** the standout finding. `fsync.Store.Lock` at **12.9
-  ns** is **4× faster than `fsync.MutexStore.Lock` (51.5 ns)** under
-  extreme single-key contention, because the Load-then-CAS spin keeps
-  the cacheline in Shared state during the hold (one Modified
-  transition per acquire, not per retry). Before this optim the same
-  workload took ~370 ns on `Store.Lock` (~×30 improvement). On the
-  moderate regime, however, `MutexStore` still wins (5.5 vs 15 ns):
-  the 32 slots that share `lockused` on a Store bucket end up
-  cache-bouncing across multiple goroutines, while each `MutexStore`
-  slot has its own 64-byte mutex cacheline.
-- **Uncontended:** `fsync.Store.Lock` (1.05 ns) is the fastest of all,
-  *including* a plain `xsync.Map` Load (1.03 ns) — the
+- **Single-key:** the standout finding. `fsync.Store.Lock` at
+  **12.68 ns** is **4× faster than `fsync.MutexStore.Lock` (51 ns)**
+  under extreme single-key contention, because the Load-then-CAS
+  spin keeps the cacheline in Shared state during the hold (one
+  Modified transition per acquire, not per retry). Before this
+  optim the same workload took ~370 ns on `Store.Lock` (~×30
+  improvement). On the moderate regime, however, `MutexStore`
+  still wins (5.1 vs 15.6 ns): the 32 slots that share `lockused`
+  on a Store bucket end up cache-bouncing across multiple
+  goroutines, while each `MutexStore` slot has its own 64-byte
+  mutex cacheline.
+- **Uncontended:** `fsync.Store.Lock` (1.07 ns) is the fastest of
+  all, *including* a plain `xsync.Map` Load (1.04 ns) — the
   pin/check/unpin cycle of a Load-then-CAS roughly matches a Load
-  here. `fsync.MutexStore.Lock` (1.20 ns) is slightly behind because
-  of the mutex.Lock/Unlock atomics. `fsync.Map.Lock` (3.62 ns)
-  carries the bucket-walk overhead.
-- `fsync.Map.LockOrStore` (8.80 ns) is competitive with
-  `xsync.Map[*{mu,v}].LoadOrStore` (7.99 ns) and beats
-  `sync.Map.LoadOrStore` (10.06 ns) on insert.
+  here. `fsync.MutexStore.Lock` (1.18 ns) is slightly behind
+  because of the mutex.Lock/Unlock atomics. `fsync.Map.Lock`
+  (3.77 ns) carries the bucket-walk overhead.
+- `fsync.Map.LockOrStore` (8.56 ns) is competitive with
+  `xsync.Map[*{mu,v}].LoadOrStore` (7.60 ns) and beats
+  `sync.Map.LoadOrStore` (9.35 ns) on insert.
 - **Rule of thumb:**
   - **Moderate / read-heavy contention** → `fsync.MutexStore` for
     Lock-heavy workloads, `fsync.Store` for everything else.
@@ -288,9 +293,9 @@ Notes:
 
 | Implementation                  | ReadOnly    |
 |---------------------------------|------------:|
-| `sync.Map[string]int`           |     3.49 ns |
-| `xsync.Map[string]int` v4       | **2.10 ns** |
-| **`fsync.Map[string]int`**      | **3.26 ns** |
+| `sync.Map[string]int`           |     3.44 ns |
+| `xsync.Map[string]int` v4       | **2.04 ns** |
+| **`fsync.Map[string]int`**      | **3.14 ns** |
 
 (Same picture as for `int` keys, just shifted higher by the cost of
 `maphash.String` on every Load. `xsync.Map` keeps its tighter-bucket
@@ -312,25 +317,25 @@ are median of 2 runs at `-benchtime=2s`; lower is better.
 
 | GOMAXPROCS | `map[int]int` | `sync.Map` | `xsync.Map` | `fsync.Map` | `fsync.Store` | `fsync.MutexStore` |
 |---:|---:|---:|---:|---:|---:|---:|
-|  1 | **5.85 ns** | 11.72 ns | 3.92 ns | **5.67 ns** | 3.63 ns | 3.98 ns |
-|  2 |     4.58 ns |  6.32 ns | 2.10 ns |     3.01 ns | 3.17 ns | 3.00 ns |
-|  4 |     2.66 ns |  3.57 ns | 1.26 ns |     1.80 ns | 2.11 ns | 1.47 ns |
-|  6 |     2.68 ns |  2.55 ns | 0.89 ns |     1.30 ns | 1.32 ns | 1.02 ns |
-|  8 |     2.33 ns |  2.54 ns | 0.91 ns |     1.25 ns | 0.97 ns | 1.00 ns |
-| 10 |     2.16 ns |  2.57 ns | 0.91 ns |     1.27 ns | 0.81 ns | 0.95 ns |
-| 12 |     1.82 ns |  2.56 ns | 0.91 ns |     1.28 ns | 0.79 ns | 1.02 ns |
+|  1 | **5.79 ns** | 11.66 ns | 3.89 ns | **5.76 ns** | 3.66 ns | 3.96 ns |
+|  2 |     4.74 ns |  6.25 ns | 2.11 ns |     3.10 ns | 3.02 ns | 2.71 ns |
+|  4 |     2.83 ns |  3.88 ns | 1.30 ns |     1.90 ns | 2.46 ns | 1.42 ns |
+|  6 |     2.98 ns |  2.95 ns | 1.06 ns |     1.49 ns | 1.65 ns | 1.17 ns |
+|  8 |     1.53 ns |  2.99 ns | 1.01 ns |     1.50 ns | 1.19 ns | 1.08 ns |
+| 10 |     2.04 ns |  2.99 ns | 1.03 ns |     1.51 ns | 1.00 ns | 1.04 ns |
+| 12 |     1.84 ns |  2.98 ns | 1.03 ns |     1.51 ns | 0.82 ns | 0.98 ns |
 
 #### `LoadOrStore` (2048 keys preloaded, parallel get-or-set)
 
 | GOMAXPROCS | `sync.Map` | `xsync.Map` | `fsync.Map` | `fsync.Store` | `fsync.MutexStore` |
 |---:|---:|---:|---:|---:|---:|
-|  1 | 34.11 ns | 5.57 ns | **6.68 ns** | 4.53 ns | 4.82 ns |
-|  2 | 18.55 ns | 2.92 ns |     3.56 ns | 2.44 ns | 2.56 ns |
-|  4 | 10.77 ns | 1.78 ns |     2.09 ns | 1.50 ns | 1.60 ns |
-|  6 |  8.34 ns | 1.30 ns |     1.46 ns | 1.14 ns | 1.15 ns |
-|  8 |  8.23 ns | 1.26 ns |     1.46 ns | 1.26 ns | 1.12 ns |
-| 10 |  8.20 ns | 1.26 ns |     1.44 ns | 1.23 ns | 1.11 ns |
-| 12 |  8.95 ns | 1.23 ns |     1.42 ns | 1.11 ns | 1.09 ns |
+|  1 | 33.88 ns | 5.53 ns | **6.37 ns** | 4.41 ns | 4.67 ns |
+|  2 | 18.74 ns | 2.94 ns |     3.35 ns | 2.43 ns | 2.59 ns |
+|  4 | 11.75 ns | 1.82 ns |     2.07 ns | 1.56 ns | 1.61 ns |
+|  6 |  9.47 ns | 1.43 ns |     1.62 ns | 1.33 ns | 1.38 ns |
+|  8 |  9.33 ns | 1.41 ns |     1.63 ns | 1.82 ns | 1.29 ns |
+| 10 |  9.27 ns | 1.40 ns |     1.64 ns | 1.37 ns | 1.34 ns |
+| 12 |  9.95 ns | 1.38 ns |     1.66 ns | 1.19 ns | 1.26 ns |
 
 The headline: **at `GOMAXPROCS=1`, `fsync.Map.ReadOnly` (5.67 ns) is
 within 3 % of a plain `map[int]int` (5.85 ns)** — meaning the
@@ -370,17 +375,19 @@ results (median of 2 runs at `-benchtime=2s`):
 
 | GOMAXPROCS | `map[string]int` | `sync.Map` | `xsync.Map` | `fsync.Map` |
 |---:|---:|---:|---:|---:|
-|  1 |  **8.21 ns** | 13.42 ns | 7.89 ns | **11.71 ns** |
-|  4 |     2.51 ns |  4.25 ns | 2.46 ns |     3.52 ns |
-| 12 |     2.59 ns |  2.91 ns | 1.75 ns |     2.60 ns |
+|  1 |  **8.21 ns** | 13.79 ns | 7.91 ns | **11.75 ns** |
+|  4 |     2.51 ns |  4.39 ns | 2.66 ns |     3.92 ns |
+| 12 |     2.59 ns |  3.44 ns | 2.04 ns |     3.14 ns |
+
+(`map[string]int` is the lockless baseline, not re-measured this run — it scales as in `int`-keyed tables.)
 
 `LoadOrStore` (steady state, all keys preloaded):
 
 | GOMAXPROCS | `sync.Map` | `xsync.Map` | `fsync.Map` |
 |---:|---:|---:|---:|
-|  1 | 59.29 ns | 10.32 ns | **12.72 ns** |
-|  4 | 15.57 ns |  3.30 ns |     3.83 ns |
-| 12 | 13.43 ns |  2.22 ns |     2.74 ns |
+|  1 | 47.65 ns | 10.30 ns | **12.66 ns** |
+|  4 | 16.48 ns |  3.43 ns |     4.22 ns |
+| 12 | 14.88 ns |  2.62 ns |     3.32 ns |
 
 `StoreWithAlloc` — inserts a fresh `strconv.Itoa(n)` key on every
 iteration. The strconv allocation cost is *included* in the per-op
@@ -389,8 +396,8 @@ string key from outside.
 
 | GOMAXPROCS | `sync.Map`             | `xsync.Map`            | `fsync.Map`            |
 |---:|-----------------------:|-----------------------:|-----------------------:|
-|  1 |  559 ns / **4 allocs** | 370 ns / **2 allocs**  | **430 ns / 1 alloc**   |
-| 12 |  108 ns / 4 allocs     |  90 ns / 2 allocs      | **117 ns / 1 alloc**   |
+|  1 |  542 ns / **4 allocs** | 368 ns / **2 allocs**  | **370 ns / 1 alloc**   |
+| 12 |  109 ns / 4 allocs     |  76 ns / 2 allocs      | **106 ns / 1 alloc**   |
 
 Highlights:
 
@@ -444,11 +451,11 @@ Ryzen 5 8540U, 12 threads):
 
 | Implementation             | Add                 | Contains    | Add+Remove           | Range/key   |
 |----------------------------|--------------------:|------------:|---------------------:|------------:|
-| `map[int]struct{}`+`Mutex` | (baseline workload) |      —      |                  —   |          —  |
-| `sync.Map` (stdlib)        | 109 ns / 2 allocs   |     2.77 ns |                  —   |          —  |
-| `xsync.Map[K, struct{}]`   | 78.8 ns / 1 alloc   | **1.01 ns** | 31.9 ns / **1 alloc**|     4.92 ns |
-| `fsync.Map[K, struct{}]`   | 58.9 ns / 0 alloc   | 1.57 ns     | 35.9 ns / 0 alloc    |         —   |
-| **`fsync.Set`**            | **55.7 ns / 0 alloc** | **1.45 ns** | **34.9 ns / 0 alloc**| **3.42 ns** |
+| `map[int]struct{}`+`Mutex` | 214 ns / 0 allocs   |      —      |                  —   |          —  |
+| `sync.Map` (stdlib)        | 84.7 ns / 2 allocs  |     2.81 ns |                  —   |     5.13 ns |
+| `xsync.Map[K, struct{}]`   | 80.1 ns / 1 alloc   | **0.93 ns** | 30.2 ns / **1 alloc**|     5.61 ns |
+| `fsync.Map[K, struct{}]`   | 55.0 ns / 0 alloc   | 1.48 ns     | 35.1 ns / 0 alloc    |     2.55 ns |
+| **`fsync.Set`**            | **51.9 ns / 0 alloc** | **1.36 ns** | **33.7 ns / 0 alloc**| **2.59 ns** |
 
 Footprint for 1M `int` keys (measured via `runtime.ReadMemStats`):
 
@@ -469,18 +476,18 @@ Set's bucket is 8 B smaller (no `pins` word), which compounds to
 
 Readings:
 
-- **vs `fsync.Map[K, struct{}]`:** Set is ~5 % faster on Add,
+- **vs `fsync.Map[K, struct{}]`:** Set is ~6 % faster on Add,
   ~8 % faster on Contains, **13 % less RAM** (no `pins` word in
   the bucket). The specialization is small but real — Map's
   seqlock and pin word are dead weight in the Set use case.
 - **vs `xsync.Map[K, struct{}]`:** Set saves **1 alloc per
-  insert** (Add 56 vs 79 ns) and is 15 % lighter on RAM. xsync
-  still wins Contains (1.01 vs 1.45 ns) thanks to a tighter
+  insert** (Add 52 vs 80 ns) and is 15 % lighter on RAM. xsync
+  still wins Contains (0.93 vs 1.36 ns) thanks to a tighter
   bucket layout with no state-check on the hot path.
-- **vs `sync.Map`:** ~2× faster on Add, with 2 allocs/op cut to 0;
-  ~2× faster on Contains.
-- **Range/key at 3.42 ns** is **1.4× faster than `xsync.Map`**
-  (4.92 ns) thanks to the inline `[8]K` bucket layout — one
+- **vs `sync.Map`:** ~1.6× faster on Add, with 2 allocs/op cut to
+  0; ~2× faster on Contains.
+- **Range/key at 2.59 ns** is **~2.2× faster than `xsync.Map`**
+  (5.61 ns) thanks to the inline `[8]K` bucket layout — one
   cacheline read per 8 keys.
 
 When to pick which: use `fsync.Set` whenever you'd otherwise write
@@ -527,22 +534,22 @@ same Ryzen 5 8540U, 12 threads):
 
 | Implementation                  | Set                  | Has          | Set+Unset            | Range/key   |
 |---------------------------------|---------------------:|-------------:|---------------------:|------------:|
-| `map[int64]bool` + `sync.Mutex` | 195 ns               |     26.3 ns  |                  —   |          —  |
-| `xsync.Map[int64, bool]` v4     | 52.9 ns / **1 alloc**|     1.02 ns  | 32.6 ns / **1 alloc**|     5.09 ns |
-| `fsync.Store[bool]`             | 14.7 ns / 0 alloc    |     2.88 ns  |  **6.6 ns / 0 alloc**|     1.60 ns |
-| **`fsync.Bitmap`**              | **1.6 ns / 0 alloc** | **0.53 ns**  |     23.6 ns / 0 alloc| **1.51 ns** |
+| `map[int64]bool` + `sync.Mutex` | 192 ns               |     25.3 ns  |                  —   |          —  |
+| `xsync.Map[int64, bool]` v4     | 49.9 ns / **1 alloc**|     0.98 ns  | 31.8 ns / **1 alloc**|     4.53 ns |
+| `fsync.Store[bool]`             | 15.4 ns / 0 alloc    |     2.57 ns  |  **6.35 ns / 0 alloc**|    1.47 ns |
+| **`fsync.Bitmap`**              | **1.68 ns / 0 alloc** | **0.52 ns** |     23.5 ns / 0 alloc| **1.53 ns** |
 
 Readings:
 
-- **`Has` at 0.53 ns/op** is the fastest lookup of the whole package:
-  ~5× faster than `Store[bool].Load` (2.88 ns) and 2× faster than
-  `xsync.Map.Load` (1.02 ns). A single `Uint64.Load` + bitmask, no
+- **`Has` at 0.52 ns/op** is the fastest lookup of the whole package:
+  ~5× faster than `Store[bool].Load` (2.57 ns) and ~2× faster than
+  `xsync.Map.Load` (0.98 ns). A single `Uint64.Load` + bitmask, no
   pin-word, no per-slot indirection.
-- **`Set` at 1.6 ns** is **9× faster** than `Store[bool].Store`
-  (14.7 ns) and **33× faster** than `xsync.Map.Store` (52.9 ns).
+- **`Set` at 1.68 ns** is **9× faster** than `Store[bool].Store`
+  (15.4 ns) and **~30× faster** than `xsync.Map.Store` (49.9 ns).
   One atomic `Or` on the chosen word in the bucket; write-coalescing
   on a hot cacheline as a side-benefit of the 8-word bucket.
-- **`Range/key` at 1.51 ns** is the package record. Iteration uses
+- **`Range/key` at 1.53 ns** is the package record. Iteration uses
   `bits.TrailingZeros64` to walk only set bits within each bucket
   word — no per-slot scan. Range scales linearly from 1K to 1M
   bits at a steady 1.5 ns/bit, and degrades gracefully on sparse
@@ -554,7 +561,7 @@ Readings:
   pay a per-empty-slot tax. See `benchs/bitmap_bench_test.go`
   for the full density/scaling matrix.
 - **`Set+Unset` (rolling window of 1024 indexes) is the one
-  weakness**: 23.6 ns vs `Store[bool]`'s 6.6 ns. With 512 bits per
+  weakness**: 23.5 ns vs `Store[bool]`'s 6.35 ns. With 512 bits per
   bucket the rolling window concentrates pressure on just 2 buckets
   (vs 32 for `Store[bool]`'s 32-slot buckets), so the cacheline
   ping-pong between 12 cores hits harder. On *non-contended* writes
@@ -625,30 +632,30 @@ Three workloads benchmarked (`./benchs/queue_bench_test.go`):
 
 | Implementation                         | SerialPingPong | MPMC (4P+4C) | SPSC (1P+1C) |
 |----------------------------------------|---------------:|-------------:|-------------:|
-| `chan T` (buffered, capacity 1024)     |        18.0 ns |      52.1 ns |      29.5 ns |
-| `xsync.MPMCQueue` (bounded, 1024)      |     **8.45 ns**|       152 ns |           —  |
-| `xsync.SPSCQueue` (bounded, 1024)      |     **3.55 ns**|           —  |      36.1 ns |
-| `xsync.UMPSCQueue` (unbounded MPSC)    |              — |           —  |      17.2 ns |
-| **`fsync.Queue`**                      |     **9.55 ns**| **31.9 ns**  | **8.85 ns**  |
-| **`fsync.MutexQueue`** (baseline)      |        11.1 ns |      58.3 ns |      19.6 ns |
+| `chan T` (buffered, capacity 1024)     |        17.8 ns |      50.4 ns |      26.8 ns |
+| `xsync.MPMCQueue` (bounded, 1024)      |     **7.82 ns**|       141 ns |           —  |
+| `xsync.SPSCQueue` (bounded, 1024)      |     **3.31 ns**|           —  |      31.9 ns |
+| `xsync.UMPSCQueue` (unbounded MPSC)    |              — |           —  |      19.2 ns |
+| **`fsync.Queue`**                      |     **8.68 ns**| **32.1 ns**  | **9.16 ns**  |
+| **`fsync.MutexQueue`** (baseline)      |        10.4 ns |      57.2 ns |      19.1 ns |
 
 Readings:
 
-- **MPMC**: `fsync.Queue` (31.9 ns) is **~5× faster than
-  `xsync.MPMCQueue`** (152 ns) and ~1.6× faster than a buffered `chan`
-  (52.1 ns). The segment-per-block design lets producers
+- **MPMC**: `fsync.Queue` (32.1 ns) is **~4.4× faster than
+  `xsync.MPMCQueue`** (141 ns) and ~1.6× faster than a buffered `chan`
+  (50.4 ns). The segment-per-block design lets producers
   fetch-add into the tail segment while consumers CAS-advance the
   head segment, with no global cursor cacheline ping-pong.
-- **SPSC**: `fsync.Queue` (8.85 ns) is **~4× faster than
-  `xsync.SPSCQueue`** (36.1 ns) and ~3× faster than `chan` (29.5
+- **SPSC**: `fsync.Queue` (9.16 ns) is **~3.5× faster than
+  `xsync.SPSCQueue`** (31.9 ns) and ~3× faster than `chan` (26.8
   ns) — the producer and consumer cursors sit on disjoint
   cachelines via padding, so the single-pair regime sees no
   ping-pong at all.
-- **SerialPingPong**: `xsync.SPSCQueue` wins (3.55 ns) — its
+- **SerialPingPong**: `xsync.SPSCQueue` wins (3.31 ns) — its
   bounded ring + zero atomics on the uncontended fast path is hard
-  to beat in pure single-goroutine throughput; `fsync.Queue` (9.55
-  ns) trades that for being unbounded and MPMC-safe. Buffered
-  `chan` (18 ns) loses to both even here.
+  to beat in pure single-goroutine throughput; `fsync.Queue`
+  (8.68 ns) trades that for being unbounded and MPMC-safe.
+  Buffered `chan` (17.8 ns) loses to both even here.
 - **Memory** (B/op shown in raw bench output): all queues report
   **0 allocs/op** thanks to segment amortization (`Queue` allocates
   one 64-slot segment per 64 elements). The reported `B/op` is the
