@@ -3,7 +3,7 @@
 Package `github.com/aytechnet/fsync` : alternatives concurrentes plus rapides que
 `sync.Map` / `puzpuzpuz/xsync` pour la plateforme iPaaS DyaPi. Go 1.25.
 
-Cinq structures, cinq niches :
+Six structures, six niches :
 
 | Type            | Clé             | Valeur (inline)            | Niche                                  |
 |-----------------|------------------|----------------------------|----------------------------------------|
@@ -11,6 +11,7 @@ Cinq structures, cinq niches :
 | `MutexStore[V]` | `int64`          | `[64]V` + `[64]sync.Mutex` | idem, mutex par slot (contention forte) |
 | `Map[K,V]`      | `K comparable`   | `[8]V` par bucket           | hash map générique concurrente         |
 | `Set[K]`        | `K comparable`   | `[8]K` par bucket (`V=struct{}`) | wrapper typé sur `Map[K, struct{}]` |
+| `Bitmap`        | `int64`          | 64 bits/bucket (`atomic.Uint64`) | bit set dense, ~10× plus léger que `Store[bool]` |
 | `Queue[T]`      | —                | `[64]T` par segment        | MPMC FIFO unbounded lock-free          |
 
 Différenciateur central : **`Lock(k)` renvoie un `*V` stable** vers la valeur
@@ -26,11 +27,13 @@ rebuilds (politique « duplicate-on-pin » du Map). Remplace l'idiome canonique
 | `store.go`                       | `Store[V]` + `MutexStore[V]`                    |
 | `map.go`                         | `Map[K,V]` (le gros morceau, ~820 l.)            |
 | `set.go`                         | `Set[K]` — wrapper léger sur `Map[K, struct{}]` (~60 l.) |
+| `bitmap.go`                      | `Bitmap` — bit set int64-indexé (~280 l.), même mécanique `bucket / bucketAlloc / Grow` que `Store` mais bucket = 1 `atomic.Uint64` |
 | `queue.go`                       | `Queue[T]` + `MutexQueue[T]` — MPMC FIFO unbounded |
 | `store_test.go`                  | tests séquentiels + concurrents de Store/MutexStore + `LockOrStore` |
 | `map_test.go`, `map_concur_test.go` | tests `Map` (séquentiel, rebuild, pins, concurrent) |
 | `map_load_during_lock_test.go`   | test `Load` pendant `Lock` (build tag `!race`)  |
 | `set_test.go`                    | tests `Set` (séquentiel + concurrent)            |
+| `bitmap_test.go`                 | tests `Bitmap` (basic, start offset, cross-bucket, Toggle, Grow, big concurrent) |
 | `concur_test.go`                 | tests croisés                                   |
 | `benchs/`                        | sous-package des benchmarks comparatifs         |
 | `README.md`                      | description + tableaux de perf publiables       |

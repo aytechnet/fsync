@@ -15,6 +15,7 @@ targeted at a different niche:
 | `MutexStore[V]` | `int64`          | inline `[64]V`  | same, mutex per slot (contention)      |
 | `Map[K,V]`      | `K comparable`   | inline `[8]V`   | general concurrent hash map            |
 | `Set[K]`        | `K comparable`   | inline `[8]K`   | concurrent set-of-keys (zero-value V)  |
+| `Bitmap`        | `int64`          | 64 bits/bucket  | dense bit set (~10× lighter than `Store[bool]`) |
 | `Queue[T]`      | —                | inline `[64]T`  | unbounded MPMC FIFO, lock-free         |
 
 ## What makes it different — `Lock` returns a stable `*V`
@@ -475,6 +476,86 @@ When to pick which: use `fsync.Set` whenever you'd otherwise write
 Use `xsync.Map[K, struct{}]` if your workload is read-dominated on
 ints and the 0.4 ns gap on `Contains` is the bottleneck. Use plain
 `map[K]struct{}` only when the workload is single-goroutine.
+
+### `Bitmap` — dense bit set on `int64` indexes
+
+`Bitmap` is the specialized version of `Store[bool]`: each bucket
+packs **64 bits in a single `atomic.Uint64`** word, with no
+`values` array at all. The per-bit memory cost drops from ~1.25
+bytes (`Store[bool]`: `[32]bool` + a `lockused` word per 32 bits)
+to **0.125 byte** — a **10× win on steady-state memory**, with
+faster reads as a bonus (one atomic Load and one bitmask, no pin
+pattern).
+
+The constructor takes a `start int64` like `Store`: `Bitmap.Set(i)`
+addresses absolute slot `i - start`, and calls with `i < start` are
+no-ops. The zero value is usable (start defaults to 0). There is no
+`Lock(*V)` API — a pointer to a single bit does not exist, and
+Set / Unset / Has / Toggle are already lock-free single-atomic
+operations on the bucket word.
+
+API:
+
+```go
+NewBitmap(start int64) *Bitmap
+(*Bitmap).Grow(maxIndex int64)
+(*Bitmap).Set(i int64) (added bool)     // true if transitioned 0→1
+(*Bitmap).Unset(i int64) (removed bool) // true if transitioned 1→0
+(*Bitmap).Has(i int64) bool
+(*Bitmap).Toggle(i int64) (nowSet bool)
+(*Bitmap).Len() int                     // popcount over all buckets
+(*Bitmap).Range(f func(i int64) bool)   // ascending order, weakly consistent
+(*Bitmap).Clear()
+```
+
+Benchmarks on `int64` keys (medians of 3 × `-benchtime=500ms`,
+same Ryzen 5 8540U, 12 threads):
+
+| Implementation                  | Set                  | Has          | Set+Unset            | Range/key   |
+|---------------------------------|---------------------:|-------------:|---------------------:|------------:|
+| `map[int64]bool` + `sync.Mutex` | 195 ns               |     26.3 ns  |                  —   |          —  |
+| `xsync.Map[int64, bool]` v4     | 52.9 ns / **1 alloc**|     1.02 ns  | 32.6 ns / **1 alloc**|     5.09 ns |
+| `fsync.Store[bool]`             | 14.7 ns / 0 alloc    |     2.88 ns  |  **6.6 ns / 0 alloc**|     1.60 ns |
+| **`fsync.Bitmap`**              | **5.0 ns / 0 alloc** | **0.43 ns**  |     19.0 ns / 0 alloc| **1.44 ns** |
+
+Readings:
+
+- **`Has` at 0.43 ns/op is the fastest lookup of the whole package**:
+  6.5× faster than `Store[bool].Load` (2.88 ns) and 2.4× faster than
+  `xsync.Map.Load` (1.02 ns). A single `Uint64.Load` + bitmask, no
+  pin-word, no per-slot indirection.
+- **`Set` at 5.0 ns** is 3× faster than `Store[bool].Store` (14.7 ns)
+  and 11× faster than `xsync.Map.Store` (52.9 ns). One atomic `Or`
+  on the bucket word — the bit *is* the value, no values[] write
+  follows.
+- **`Range/key` at 1.44 ns** is the package record. Iteration uses
+  `bits.TrailingZeros64` to walk only set bits within each bucket
+  word — no per-slot scan.
+- **`Set+Unset` (rolling window of 1024 indexes) is the one
+  weakness**: 19.0 ns vs `Store[bool]`'s 6.6 ns. With 64 slots per
+  bucket, the rolling window concentrates pressure on just 16
+  cachelines (vs 32 for Store's 32-slot buckets), so the cacheline
+  ping-pong between 12 cores hits harder. On *non-contended* writes
+  (distinct keys per worker), Bitmap stays well ahead.
+
+Memory footprint comparison (steady state, 1M indexes set):
+
+| Implementation                  | RAM for 1M bits     |
+|---------------------------------|---------------------|
+| `map[int64]bool`                | ~32 MB (Go map overhead) |
+| `xsync.Map[int64, bool]`        | ~32 MB              |
+| `fsync.Store[bool]`             | ~1.3 MB             |
+| **`fsync.Bitmap`**              | **~125 KB**         |
+
+When to pick which: use `Bitmap` whenever the workload reduces to
+"is index `i` set/unset" on a dense or sparse `int64` domain
+(presence flags, free-slot maps, bloom-filter-like structures,
+visited sets in graph algorithms). Use `Store[bool]` if you need
+the `Lock(*V)` semantics or are okay with the 10× memory cost in
+exchange for ~3× faster write-then-clear churn cycles. Use
+`xsync.Map[int64, bool]` only if your indexes are extremely sparse
+across the int64 range AND you can't afford the virtual address
+reservation that `Bitmap.Grow` makes.
 
 ### `Queue[T]` and `MutexQueue[T]` — unbounded MPMC FIFO
 
