@@ -538,14 +538,26 @@ Readings:
   ping-pong between 12 cores hits harder. On *non-contended* writes
   (distinct keys per worker), Bitmap stays well ahead.
 
-Memory footprint comparison (steady state, 1M indexes set):
+Memory footprint comparison (heap delta measured via
+`runtime.ReadMemStats` after inserting 1M distinct indexes from a
+single goroutine, GC forced before and after):
 
-| Implementation                  | RAM for 1M bits     |
-|---------------------------------|---------------------|
-| `map[int64]bool`                | ~32 MB (Go map overhead) |
-| `xsync.Map[int64, bool]`        | ~32 MB              |
-| `fsync.Store[bool]`             | ~1.3 MB             |
-| **`fsync.Bitmap`**              | **~125 KB**         |
+| Implementation                  | RAM for 1M bits | per entry |
+|---------------------------------|----------------:|----------:|
+| `map[int64]bool` + `sync.Mutex` |        36.1 MB  |     37 B  |
+| `xsync.Map[int64, bool]`        |        47.8 MB  |     50 B  |
+| `fsync.Map[int64, bool]`        |        47.0 MB  |     49 B  |
+| `fsync.Store[bool]`             |         1.7 MB  |      1 B  |
+| **`fsync.Bitmap`**              |    **0.24 MB**  |   **0 B** (~0.25) |
+
+`fsync.Map[int64, bool]` and `xsync.Map[int64, bool]` land within
+~2 % of each other: both pay for hashed-bucket overhead (tags, pin
+words, per-bucket sync primitives) that dwarfs the 1-byte `bool`
+payload. `fsync.Store[bool]` skips hashing entirely and packs 32
+bools per bucket alongside a single `lockused` word — already a
+**~30× win**. `Bitmap` packs 64 bits per `atomic.Uint64`, no values
+array — another **~7× win on top of `Store[bool]`** and **~200×
+smaller than the hashed maps**.
 
 When to pick which: use `Bitmap` whenever the workload reduces to
 "is index `i` set/unset" on a dense or sparse `int64` domain
