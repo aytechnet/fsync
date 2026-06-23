@@ -40,9 +40,9 @@ p, cur, _ := m.Lock("hits")
 cur.Unlock()            // defer cur.Unlock() is the idiomatic pattern
 
 // Pre-size to skip warmup doublings; Grow is chainable.
-counters := fsync.NewMap[int, int64](0).Grow(100_000)
+counters := fsync.NewMap[int, int64]().Grow(100_000)
 
-// Bitmap: dense int64-indexed bit set, ~125 KB for 1M bits.
+// Bitmap: dense int64-indexed bit set, ~145 KB for 1M bits.
 var seen fsync.Bitmap
 seen.Set(42)
 seen.Has(42)            // true
@@ -284,12 +284,18 @@ Notes:
   - **Extreme contention on a single hot key** → `fsync.Store` wins.
   - **No contention** → `fsync.Store` everywhere.
 
-### `Map[string]int` (2048 keys preloaded)
+### `Map[string]int` (2048 keys preloaded, GOMAXPROCS=12)
 
 | Implementation                  | ReadOnly    |
 |---------------------------------|------------:|
-| `sync.Map[string]int`           |     3.09 ns |
-| **`fsync.Map[string]int`**      | **2.79 ns** |
+| `sync.Map[string]int`           |     3.49 ns |
+| `xsync.Map[string]int` v4       | **2.10 ns** |
+| **`fsync.Map[string]int`**      | **3.26 ns** |
+
+(Same picture as for `int` keys, just shifted higher by the cost of
+`maphash.String` on every Load. `xsync.Map` keeps its tighter-bucket
+lead; `fsync.Map` lands between sync and xsync. See the per-procs
+breakdown below for scaling behavior.)
 
 ### Scaling from `GOMAXPROCS=1` to `12` — drop-in for a non-concurrent map?
 
@@ -381,10 +387,10 @@ iteration. The strconv allocation cost is *included* in the per-op
 number on purpose: this is the realistic cost of seeing a fresh
 string key from outside.
 
-| GOMAXPROCS | `sync.Map`          | `fsync.Map`        |
-|---:|--------------------:|-------------------:|
-|  1 | 759 ns / **4 allocs** | 548 ns / **1 alloc** |
-| 12 | 121 ns / 4 allocs   | 124 ns / 1 alloc    |
+| GOMAXPROCS | `sync.Map`             | `xsync.Map`            | `fsync.Map`            |
+|---:|-----------------------:|-----------------------:|-----------------------:|
+|  1 |  559 ns / **4 allocs** | 370 ns / **2 allocs**  | **430 ns / 1 alloc**   |
+| 12 |  108 ns / 4 allocs     |  90 ns / 2 allocs      | **117 ns / 1 alloc**   |
 
 Highlights:
 
@@ -399,10 +405,15 @@ Highlights:
   carries 4 heap allocations per call; `fsync.Map` has 1 (the
   `strconv.Itoa` only). At 1 G the alloc cost dominates everything
   else and the gap shrinks at 12 G as GC amortizes across cores.
-- On the `StoreWithAlloc` workload, `fsync.Map` is ~30 % faster at
-  1 G thanks to its 4× fewer allocations; at 12 G they converge.
-  This is the realistic insertion-rate ceiling, allocations
-  included.
+- On the `StoreWithAlloc` workload, `fsync.Map` carries the
+  fewest allocations (1 — the unavoidable `strconv.Itoa`), against
+  4 for `sync.Map` and 2 for `xsync.Map`. At low GOMAXPROCS that
+  alloc count translates to ns/op directly (430 vs 559 vs 370 at
+  1 proc — xsync wins on raw speed thanks to its faster Store
+  path); at 12 procs all three converge around 90–120 ns/op as
+  the GC amortizes across cores. The 1-alloc-per-insert floor of
+  `fsync.Map` becomes decisive on long-running insertion-heavy
+  workloads where GC pause time matters.
 
 ### `Set[K]` — concurrent set of comparable keys
 
@@ -441,11 +452,20 @@ Ryzen 5 8540U, 12 threads):
 
 Footprint for 1M `int` keys (measured via `runtime.ReadMemStats`):
 
-| Implementation             | RAM       | per entry |
-|----------------------------|----------:|----------:|
-| `xsync.Map[int, struct{}]` |  47.9 MB  |    50 B   |
-| `fsync.Map[int, struct{}]` |  47.0 MB  |    49 B   |
-| **`fsync.Set[int]`**       | **40.8 MB** | **42 B**  |
+| Implementation             | RAM       | per entry | Heap objects |
+|----------------------------|----------:|----------:|-------------:|
+| `sync.Map` (`struct{}{}` boxed) | 108.4 MB  | 113 B     |  1 860 161   |
+| `xsync.Map[int, struct{}]` |  47.9 MB  |    50 B   |  1 009 678   |
+| `fsync.Map[int, struct{}]` |  47.0 MB  |    49 B   |    412 288   |
+| **`fsync.Set[int]`**       | **40.8 MB** | **42 B**  |  **412 288** |
+
+`sync.Map` is **2.7× heavier** than the others because it stores
+both key and value as `interface{}` (16 B + 16 B box overhead per
+entry on top of the entry struct itself), and it also leaks 5×
+more heap objects to scan on every GC cycle. `fsync.Set` and
+`fsync.Map[K, struct{}]` share the same bucket count (412k) but
+Set's bucket is 8 B smaller (no `pins` word), which compounds to
+~6 MB saved at 1M entries.
 
 Readings:
 
