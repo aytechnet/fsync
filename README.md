@@ -14,6 +14,7 @@ targeted at a different niche:
 | `Store[V]`      | `int64`          | inline `[32]V`  | dense integer-indexed store, lock-free |
 | `MutexStore[V]` | `int64`          | inline `[64]V`  | same, mutex per slot (contention)      |
 | `Map[K,V]`      | `K comparable`   | inline `[8]V`   | general concurrent hash map            |
+| `Queue[T]`      | —                | inline `[64]T`  | unbounded MPMC FIFO, lock-free         |
 
 ## What makes it different — `Lock` returns a stable `*V`
 
@@ -421,6 +422,74 @@ Highlights:
   1 G thanks to its 4× fewer allocations; at 12 G they converge.
   This is the realistic insertion-rate ceiling, allocations
   included.
+
+### `Queue[T]` and `MutexQueue[T]` — unbounded MPMC FIFO
+
+`Queue[T]` is a lock-free multi-producer / multi-consumer FIFO built
+from 64-slot inline segments, chained as needed. **It is unbounded
+and never blocks**: `Enqueue` always succeeds (a new segment is
+linked when the current tail fills), `Dequeue` returns
+`(zero, false)` only when the queue is genuinely empty, never as a
+back-pressure signal. Fully drained segments become unreachable and
+are reclaimed by the GC — the queue's working memory tracks the
+live element count, not the high-water mark.
+
+The design target is the **fan-out / fan-in pattern** common in iPaaS
+glue code: an arbitrary number of producers post work, an arbitrary
+number of consumers drain it, and no one wants to size a buffered
+channel up-front or pay for a `select` per send. `Queue` is what you
+reach for when you'd otherwise write `chan T` with a guess at the
+capacity. `MutexQueue[T]` is the simple mutex-guarded baseline
+included for comparison (same role as `MutexStore` vs `Store`); not
+part of the intended public API yet.
+
+Three workloads benchmarked (`./benchs/queue_bench_test.go`):
+
+- **SerialPingPong** — single goroutine, one `Enqueue` then one
+  `Dequeue` per iteration. Pure per-op overhead, zero contention.
+- **MPMC (4P + 4C)** — four producers each enqueue while four
+  consumers each dequeue, mixed contention on both ends.
+- **SPSC (1P + 1C)** — one producer paired with one consumer,
+  workload `xsync.SPSCQueue` is tuned for.
+
+| Implementation                         | SerialPingPong | MPMC (4P+4C) | SPSC (1P+1C) |
+|----------------------------------------|---------------:|-------------:|-------------:|
+| `chan T` (buffered, capacity 1024)     |        18.0 ns |      52.1 ns |      29.5 ns |
+| `xsync.MPMCQueue` (bounded, 1024)      |     **8.45 ns**|       152 ns |           —  |
+| `xsync.SPSCQueue` (bounded, 1024)      |     **3.55 ns**|           —  |      36.1 ns |
+| `xsync.UMPSCQueue` (unbounded MPSC)    |              — |           —  |      17.2 ns |
+| **`fsync.Queue`**                      |     **9.55 ns**| **31.9 ns**  | **8.85 ns**  |
+| **`fsync.MutexQueue`** (baseline)      |        11.1 ns |      58.3 ns |      19.6 ns |
+
+Readings:
+
+- **MPMC**: `fsync.Queue` (31.9 ns) is **~5× faster than
+  `xsync.MPMCQueue`** (152 ns) and ~1.6× faster than a buffered `chan`
+  (52.1 ns). The segment-per-block design lets producers
+  fetch-add into the tail segment while consumers CAS-advance the
+  head segment, with no global cursor cacheline ping-pong.
+- **SPSC**: `fsync.Queue` (8.85 ns) is **~4× faster than
+  `xsync.SPSCQueue`** (36.1 ns) and ~3× faster than `chan` (29.5
+  ns) — the producer and consumer cursors sit on disjoint
+  cachelines via padding, so the single-pair regime sees no
+  ping-pong at all.
+- **SerialPingPong**: `xsync.SPSCQueue` wins (3.55 ns) — its
+  bounded ring + zero atomics on the uncontended fast path is hard
+  to beat in pure single-goroutine throughput; `fsync.Queue` (9.55
+  ns) trades that for being unbounded and MPMC-safe. Buffered
+  `chan` (18 ns) loses to both even here.
+- **Memory** (B/op shown in raw bench output): all queues report
+  **0 allocs/op** thanks to segment amortization (`Queue` allocates
+  one 64-slot segment per 64 elements). The reported `B/op` is the
+  amortized segment cost divided across iterations.
+
+When to pick which: use `fsync.Queue` when producers and consumers
+both scale and you can't pre-size; use `xsync.SPSCQueue` if you
+have **exactly one** producer **and one** consumer and bounded
+back-pressure is fine; use a buffered `chan` when you also need
+`select` semantics. `MutexQueue` exists as a sanity baseline and
+to handle very-low-contention call sites where the cost of an
+uncontended `sync.Mutex` is competitive.
 
 ## Methodology
 
