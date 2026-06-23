@@ -413,42 +413,42 @@ type hashStruct struct {
 
 func TestMapHashTypes(t *testing.T) {
 	t.Run("int", func(t *testing.T) {
-		m := NewMap[int, int](16)
+		m := NewMap[int, int]().Grow(16)
 		m.Store(7, 70)
 		if v, _ := m.Load(7); v != 70 {
 			t.Errorf("int: got %d", v)
 		}
 	})
 	t.Run("int64", func(t *testing.T) {
-		m := NewMap[int64, int](16)
+		m := NewMap[int64, int]().Grow(16)
 		m.Store(int64(7), 70)
 		if v, _ := m.Load(7); v != 70 {
 			t.Errorf("int64: got %d", v)
 		}
 	})
 	t.Run("uint", func(t *testing.T) {
-		m := NewMap[uint, int](16)
+		m := NewMap[uint, int]().Grow(16)
 		m.Store(uint(7), 70)
 		if v, _ := m.Load(7); v != 70 {
 			t.Errorf("uint: got %d", v)
 		}
 	})
 	t.Run("uint64", func(t *testing.T) {
-		m := NewMap[uint64, int](16)
+		m := NewMap[uint64, int]().Grow(16)
 		m.Store(uint64(7), 70)
 		if v, _ := m.Load(7); v != 70 {
 			t.Errorf("uint64: got %d", v)
 		}
 	})
 	t.Run("uintptr", func(t *testing.T) {
-		m := NewMap[uintptr, int](16)
+		m := NewMap[uintptr, int]().Grow(16)
 		m.Store(uintptr(7), 70)
 		if v, _ := m.Load(7); v != 70 {
 			t.Errorf("uintptr: got %d", v)
 		}
 	})
 	t.Run("string", func(t *testing.T) {
-		m := NewMap[string, int](16)
+		m := NewMap[string, int]().Grow(16)
 		m.Store("alpha", 1)
 		m.Store("beta", 2)
 		if v, _ := m.Load("alpha"); v != 1 {
@@ -462,7 +462,7 @@ func TestMapHashTypes(t *testing.T) {
 		}
 	})
 	t.Run("struct", func(t *testing.T) {
-		m := NewMap[hashStruct, int](16)
+		m := NewMap[hashStruct, int]().Grow(16)
 		m.Store(hashStruct{1, "x"}, 100)
 		m.Store(hashStruct{2, "y"}, 200)
 		if v, _ := m.Load(hashStruct{1, "x"}); v != 100 {
@@ -480,7 +480,7 @@ func TestMapHashTypes(t *testing.T) {
 // Exercises the next-bucket walk in LockOrStore / Lock / Delete /
 // LoadAndDelete / Range.
 func TestMapOverflowChain(t *testing.T) {
-	m := NewMap[int, int](1) // smallest table: firstSize buckets
+	m := NewMap[int, int]().Grow(1) // smallest table: firstSize buckets
 	const N = 200
 	for i := range N {
 		m.Store(i, i*3)
@@ -560,7 +560,7 @@ func TestMapStressConcurrent(t *testing.T) {
 // Drive Grow concurrently with Range so Range hits the bucketMoved /
 // nextTable follow-up path that's otherwise hard to trigger.
 func TestMapRangeDuringGrow(t *testing.T) {
-	m := NewMap[int, int](64)
+	m := NewMap[int, int]().Grow(64)
 	const N = 1000
 	for i := range N {
 		m.Store(i, -i)
@@ -592,7 +592,7 @@ func TestMapRangeDuringGrow(t *testing.T) {
 // ---------- Map[K, V] ----------
 
 func TestMapLoadOrStore(t *testing.T) {
-	m := NewMap[int, int](16)
+	m := NewMap[int, int]().Grow(16)
 
 	v, loaded := m.LoadOrStore(1, 10)
 	if loaded || v != 10 {
@@ -624,7 +624,7 @@ func TestMapLoadOrStore(t *testing.T) {
 }
 
 func TestMapRange(t *testing.T) {
-	m := NewMap[int, int](16)
+	m := NewMap[int, int]().Grow(16)
 	want := map[int]int{1: 10, 2: 20, 5: 50, 100: -100}
 	for k, v := range want {
 		m.Store(k, v)
@@ -654,7 +654,7 @@ func TestMapRange(t *testing.T) {
 }
 
 func TestMapClear(t *testing.T) {
-	m := NewMap[int, int](16)
+	m := NewMap[int, int]().Grow(16)
 	for i := 0; i < 100; i++ {
 		m.Store(i, i)
 	}
@@ -675,7 +675,7 @@ func TestMapClear(t *testing.T) {
 }
 
 func TestMapLoadAndDeleteSwapCASCAD(t *testing.T) {
-	m := NewMap[int, int](16)
+	m := NewMap[int, int]().Grow(16)
 
 	m.Store(1, 11)
 	if v, loaded := m.LoadAndDelete(1); !loaded || v != 11 {

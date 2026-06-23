@@ -45,7 +45,7 @@ func TestSetBasic(t *testing.T) {
 }
 
 func TestSetNewSetWithCapacity(t *testing.T) {
-	s := NewSet[int](1000)
+	s := NewSet[int]().Grow(1000)
 	for i := range 500 {
 		if !s.Add(i) {
 			t.Errorf(`Add(%d) on fresh set should return true`, i)

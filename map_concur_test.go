@@ -7,7 +7,7 @@ import (
 
 // Functional sanity tests
 func TestMapLoadStore(t *testing.T) {
-	m := NewMap[int, int](16)
+	m := NewMap[int, int]().Grow(16)
 	if _, ok := m.Load(42); ok {
 		t.Errorf("Load on empty should return ok=false")
 	}
@@ -27,7 +27,7 @@ func TestMapLoadStore(t *testing.T) {
 }
 
 func TestMapLockUnlock(t *testing.T) {
-	m := NewMap[int, int](16)
+	m := NewMap[int, int]().Grow(16)
 	m.Store(1, 10)
 	p, cur, ok := m.Lock(1)
 	if !ok || p == nil || *p != 10 {
@@ -46,7 +46,7 @@ func TestMapLockUnlock(t *testing.T) {
 }
 
 func TestMapDelete(t *testing.T) {
-	m := NewMap[int, int](16)
+	m := NewMap[int, int]().Grow(16)
 	if m.Delete(42) {
 		t.Errorf("Delete on empty should return false")
 	}
@@ -73,7 +73,7 @@ func TestMapDelete(t *testing.T) {
 // reusable: a fresh Store after Delete should succeed and Len stays
 // coherent.
 func TestMapDeleteAndReinsert(t *testing.T) {
-	m := NewMap[int, int](16)
+	m := NewMap[int, int]().Grow(16)
 	// fill several buckets
 	for i := range 100 {
 		m.Store(i, i*7)
@@ -114,7 +114,7 @@ func TestMapDeleteAndReinsert(t *testing.T) {
 }
 
 func TestMapLockOrStore(t *testing.T) {
-	m := NewMap[int, int](16)
+	m := NewMap[int, int]().Grow(16)
 	p, cur, created := m.LockOrStore(1, 10)
 	if p == nil || *p != 10 {
 		t.Fatalf("LockOrStore(1, 10) returned %v", p)
@@ -139,7 +139,7 @@ func TestMapLockOrStore(t *testing.T) {
 }
 
 func TestMapBigConcurrent(t *testing.T) {
-	m := NewMap[int, int](16384) // 16k buckets × 8 slots = 128k capacity
+	m := NewMap[int, int]().Grow(16384) // 16k buckets × 8 slots = 128k capacity
 	var w sync.WaitGroup
 	const items = 5000
 	const goroutines = 12
@@ -205,7 +205,7 @@ func TestMapZeroValueUsable(t *testing.T) {
 // TestMapRebuild forces several doublings by starting small and
 // inserting beyond capacity.
 func TestMapRebuild(t *testing.T) {
-	m := NewMap[int, int](16) // start very small to exercise multiple doublings
+	m := NewMap[int, int]().Grow(16) // start very small to exercise multiple doublings
 	var w sync.WaitGroup
 	const items = 5000
 	const goroutines = 8
@@ -241,7 +241,7 @@ func TestMapRebuild(t *testing.T) {
 // TestMapRebuildWithPins ensures that pinned buckets remain reachable
 // after one or more rebuilds (duplication policy).
 func TestMapRebuildWithPins(t *testing.T) {
-	m := NewMap[int, int](64)
+	m := NewMap[int, int]().Grow(64)
 	const items = 200
 	// Pre-populate and pin every 8th key — this forces some buckets to be
 	// duplicated rather than split when the next rebuild triggers.

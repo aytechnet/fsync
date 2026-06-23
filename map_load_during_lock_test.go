@@ -22,7 +22,7 @@ import (
 // (never a torn intermediate). The seqlock retry in Load catches any
 // observation that straddled a Lock+Unlock pair.
 func TestMapLoadDuringLock(t *testing.T) {
-	m := NewMap[int, int](64)
+	m := NewMap[int, int]().Grow(64)
 	const key = 42
 	m.Store(key, 0)
 

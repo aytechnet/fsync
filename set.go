@@ -16,12 +16,16 @@ type Set[K comparable] struct {
 	m Map[K, struct{}]
 }
 
-// NewSet returns an empty Set[K] pre-sized to comfortably hold
-// estimatedItems without an immediate rebuild. Pass 0 if you have no
-// estimate; the zero-value Set is equally usable.
-func NewSet[K comparable](estimatedItems int) *Set[K] {
+// NewSet returns an empty Set[K]. The zero-value Set is equally
+// usable (`var s Set[K]`); NewSet is provided for symmetry with
+// NewMap and pre-allocates the initial bucket table.
+//
+// To pre-size for a known steady-state count, chain Grow:
+//
+//	s := fsync.NewSet[string]().Grow(100_000)
+func NewSet[K comparable]() *Set[K] {
 	s := &Set[K]{}
-	s.m.table.Store(newTable[K, struct{}](bucketsFor(estimatedItems)))
+	s.m.table.Store(newTable[K, struct{}](firstSize))
 	return s
 }
 

@@ -182,9 +182,17 @@ func bucketsFor(estimatedItems int) int {
 // without an immediate rebuild. The zero-value Map is also usable: the
 // first write lazily allocates a small initial bucket table; call Grow on
 // it later if you discover the expected size.
-func NewMap[K comparable, V any](estimatedItems int) *Map[K, V] {
+// NewMap returns an empty Map[K, V]. The zero-value Map is equally
+// usable (`var m Map[K, V]`); NewMap is provided for symmetry with
+// NewQueue / NewSet and pre-allocates the initial bucket table so
+// the first Load / Store / Lock skips the lazy-init branch.
+//
+// To pre-size for a known steady-state count, chain Grow:
+//
+//	m := fsync.NewMap[int, string]().Grow(100_000)
+func NewMap[K comparable, V any]() *Map[K, V] {
 	m := &Map[K, V]{}
-	m.table.Store(newTable[K, V](bucketsFor(estimatedItems)))
+	m.table.Store(newTable[K, V](firstSize))
 	return m
 }
 
@@ -201,7 +209,7 @@ func NewMap[K comparable, V any](estimatedItems int) *Map[K, V] {
 //
 // Returns the receiver, so calls can be chained:
 //
-//	m := fsync.NewMap[int, string](0).Grow(100_000)
+//	m := fsync.NewMap[int, string]().Grow(100_000)
 func (m *Map[K, V]) Grow(estimatedItems int) *Map[K, V] {
 	target := bucketsFor(estimatedItems)
 	for {
