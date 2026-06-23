@@ -90,6 +90,79 @@ For every key independently:
 - **Always pair `Lock` with `Unlock`** — idiomatic usage is
   `defer cur.Unlock()` right after `Lock`.
 
+### Lock usage guidelines (read this before using Lock)
+
+The `Lock` primitive is the differentiator of `fsync` — it hands
+back a stable `*V` into the inline bucket with zero allocation —
+but it's also the easiest API to misuse. Read these before
+sprinkling `defer cur.Unlock()` in your code.
+
+**1. Hold the Lock for nanoseconds, not microseconds.**
+`Store[V]` and `Map[K,V]` implement `Lock` with a **busy-wait
+spin** on contention (Load-then-CAS + `runtime.Gosched()`). This
+is optimal for cycle-counted critical sections — `*p++`,
+`*p = newValue`, an append to a small slice, a counter mutation —
+but **disastrous** if you do I/O, a syscall, a network call, or
+wait on a channel under the Lock: every other goroutine touching
+the same key will burn CPU until you Unlock.
+
+The right shape is `Lock → tiny in-memory mutation → Unlock`. If
+you need the value to drive a blocking call:
+
+```go
+// WRONG: holds the spin lock during an HTTP roundtrip.
+p, cur, _ := m.Lock(id)
+*p = callExternalAPI(*p)   // every concurrent Lock/Load on `id` busy-spins
+cur.Unlock()
+
+// RIGHT: copy under Lock, do the work outside, re-apply under Lock.
+p, cur, _ := m.Lock(id)
+snapshot := *p
+cur.Unlock()
+updated := callExternalAPI(snapshot)
+p, cur, _ = m.Lock(id)
+*p = updated
+cur.Unlock()
+```
+
+If your workload genuinely needs to **block under a per-key
+lock** (e.g. serialize all writers to the same entry across an
+I/O), use **`MutexStore[V]`** instead: its `Lock` uses one
+`sync.Mutex` per slot, so contenders park in the kernel (futex)
+instead of busy-spinning. Slower on the uncontended path, but
+won't burn cores under hold.
+
+**2. Never re-Lock the same key from inside a Lock holder
+(self-deadlock).**
+The pin is per-key, not per-goroutine. A second `Lock(k)` from
+the same goroutine that already holds `Lock(k)` will spin
+forever on its own pin. Avoid calling code under Lock that might
+transitively `Lock` the same key — including helpers that
+themselves take a `Lock`.
+
+**3. The Cursor is not an ownership token; don't pass it across
+goroutines.**
+The `Cursor` returned by `Lock` identifies the bucket+slot, not
+the holder. Calling `cur.Unlock()` from a different goroutine
+than the one that `Lock`-ed is unsupported and will not be
+detected at runtime.
+
+**4. The `*V` returned by `Lock` is only valid until
+`cur.Unlock()`.**
+After Unlock, the slot may be overwritten by a concurrent
+`Store`, zeroed by a concurrent `Delete`, or (during a rebuild)
+still point into the old bucket while readers have switched to
+the new one. Never dereference `p` after `Unlock`. The
+duplicate-on-pin rebuild policy guarantees the address stays
+valid **while** pinned — that guarantee ends at Unlock.
+
+**5. `LoadOrStore` / `Swap` / `CompareAndSwap` give you
+sync.Map-style atomic ops without a holdable lock.**
+If all you need is "atomically read-and-set" or
+"swap-if-equals," use those instead of `Lock + read + write +
+Unlock` — they're faster (no pin), don't expose you to the
+guidelines above, and match the sync.Map signatures byte-for-byte.
+
 ### Full `sync.Map`-compatible surface
 
 On top of the pinning primitives, every map / set / store ships the
