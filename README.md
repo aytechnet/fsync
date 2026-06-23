@@ -532,7 +532,15 @@ Readings:
   on a hot cacheline as a side-benefit of the 8-word bucket.
 - **`Range/key` at 1.51 ns** is the package record. Iteration uses
   `bits.TrailingZeros64` to walk only set bits within each bucket
-  word — no per-slot scan.
+  word — no per-slot scan. Range scales linearly from 1K to 1M
+  bits at a steady 1.5 ns/bit, and degrades gracefully on sparse
+  inputs: ~1.8 ns/bit at 1 bit per word, ~7 ns/bit at 1 bit per
+  bucket, ~10 ns/bit at 1 bit per 8 buckets. The worst-case
+  fixed cost is "scan an empty bucket" (~4 ns: 8 atomic Loads
+  + zero check), and unallocated buckets in the table are
+  skipped via a nil-pointer check so very sparse layouts don't
+  pay a per-empty-slot tax. See `benchs/bitmap_bench_test.go`
+  for the full density/scaling matrix.
 - **`Set+Unset` (rolling window of 1024 indexes) is the one
   weakness**: 23.6 ns vs `Store[bool]`'s 6.6 ns. With 512 bits per
   bucket the rolling window concentrates pressure on just 2 buckets

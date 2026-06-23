@@ -265,3 +265,72 @@ func BenchmarkXsyncMapBoolRange(b *testing.B) {
 	}
 	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(n), "ns/key")
 }
+
+// ---------- Bitmap.Range by density ----------
+//
+// Bitmap stores 8 atomic.Uint64 per bucket (512 bits). Range uses
+// bits.TrailingZeros64 on each word so the cost per *bit visited*
+// drops as more bits share a word, but the cost per *bucket
+// scanned* is constant (8 Loads + 8 popcounts at minimum). These
+// benches keep the number of bits visited constant (rangeKeysCount)
+// and vary the step between bits to span four regimes from dense
+// to extreme sparse.
+
+const rangeKeysCount = 2048
+
+func benchBitmapRangeDensity(b *testing.B, step int64) {
+	var bm fsync.Bitmap
+	for i := int64(0); i < rangeKeysCount; i++ {
+		bm.Set(i * step)
+	}
+	b.ResetTimer()
+	b.ReportAllocs()
+	var n int
+	for i := 0; i < b.N; i++ {
+		bm.Range(func(_ int64) bool {
+			n++
+			return true
+		})
+	}
+	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(n), "ns/key")
+}
+
+// Dense: every bit set, 2048 bits in 4 buckets, 64 bits per word.
+func BenchmarkFsyncBitmapRangeDense(b *testing.B) { benchBitmapRangeDensity(b, 1) }
+
+// Sparse 1/8: every 8th bit set, 2048 bits in 32 buckets, 8 bits per word.
+func BenchmarkFsyncBitmapRangeSparse8(b *testing.B) { benchBitmapRangeDensity(b, 8) }
+
+// Sparse 1/64: 1 bit per word, 2048 bits in 256 buckets.
+func BenchmarkFsyncBitmapRangeSparse64(b *testing.B) { benchBitmapRangeDensity(b, 64) }
+
+// Sparse 1/512: 1 bit per bucket, 2048 bits in 2048 buckets — worst case.
+func BenchmarkFsyncBitmapRangeSparse512(b *testing.B) { benchBitmapRangeDensity(b, 512) }
+
+// Sparse 1/4096: 1 bit per 8 buckets (7 empty buckets between each set
+// bit), 2048 bits in 16384 buckets — pessimal scan-to-visit ratio.
+func BenchmarkFsyncBitmapRangeSparse4096(b *testing.B) { benchBitmapRangeDensity(b, 4096) }
+
+// ---------- Bitmap.Range scaling on dense input ----------
+
+func benchBitmapRangeSize(b *testing.B, total int64) {
+	var bm fsync.Bitmap
+	for i := int64(0); i < total; i++ {
+		bm.Set(i)
+	}
+	b.ResetTimer()
+	b.ReportAllocs()
+	var n int
+	for i := 0; i < b.N; i++ {
+		bm.Range(func(_ int64) bool {
+			n++
+			return true
+		})
+	}
+	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(n), "ns/key")
+}
+
+func BenchmarkFsyncBitmapRange1K(b *testing.B)   { benchBitmapRangeSize(b, 1024) }
+func BenchmarkFsyncBitmapRange16K(b *testing.B)  { benchBitmapRangeSize(b, 16*1024) }
+func BenchmarkFsyncBitmapRange256K(b *testing.B) { benchBitmapRangeSize(b, 256*1024) }
+func BenchmarkFsyncBitmapRange1M(b *testing.B)   { benchBitmapRangeSize(b, 1024*1024) }
