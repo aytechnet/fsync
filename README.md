@@ -296,6 +296,50 @@ return a stable `*V` straight into the inline slot, no `*Entry`
 indirection on any path, no first-insert spike, on every key from
 the very first one.
 
+### Memory footprint for 1M `int → int` entries
+
+The per-op B/op above is the cost of *one* insert amortized. For the
+total RAM held by a live, fully populated container, measure with
+`runtime.ReadMemStats` after inserting 1M distinct `int → int`
+entries from a single goroutine, GC forced before and after:
+
+| Implementation                  | RAM        | per entry | Heap objects |
+|---------------------------------|-----------:|----------:|-------------:|
+| `map[int]int` + `sync.Mutex`    |   36.1 MB  |     37 B  |       4 106  |
+| `xsync.Map[int, int]`           |   48.0 MB  |     50 B  |   1 011 568  |
+| **`fsync.Store[int]`**          |  **8.8 MB**|   **9 B** |  **31 256**  |
+| **`fsync.MutexStore[int]`**     |   17.3 MB  |    18 B   |     15 629   |
+| **`fsync.Map[int, int]`**       |   72.2 MB  |    75 B   |    412 288   |
+| `sync.Map` (`int → int` boxed)  |  115.9 MB  |    121 B  |   2 359 268  |
+
+Reading:
+
+- **`Store[V]`** is the most compact at **9 B/entry** — the dense
+  integer index skips hashing and packs 32 `V` values per
+  bucket alongside a single `lockused` word. Use it whenever
+  your key is already a dense `int64`.
+- **`MutexStore[V]`** doubles that to 18 B/entry because each
+  64-slot bucket carries 64 `sync.Mutex` (one per slot, ~16 B
+  each), the price of futex-parking instead of bit-spinning.
+- **`Map[K, V]`** generic costs 75 B/entry vs xsync's 50 B —
+  the extra 25 B comes from the 8-byte `pins` word, the 4-byte
+  `state` field and the `sync.Mutex` per bucket that
+  `xsync.Map` doesn't need (no `Lock(*V)` API there). The
+  tradeoff: you pay for the bucket's writer serialization in
+  exchange for a stable pointer back to the inline `V`. For
+  read-only or struct{}-valued workloads, switch to `Set[K]`
+  (42 B/entry, see Set section) which drops the `pins` word.
+- **`sync.Map`** balloons to 121 B/entry because both key and
+  value are boxed as `interface{}` — that's two 16-byte
+  interface headers plus the entry struct, per entry, plus the
+  read-mostly fast path's per-key entry pointer. The 2.4 M
+  heap objects are 6× what `fsync.Map` carries.
+
+For 1M-bit-style workloads, see the `Bitmap` section
+(0.13 B/entry); for set-of-keys workloads, see the `Set`
+section (42 B/entry); for FIFO queues, see the `Queue` section
+(11 B/item).
+
 ### Per-entry locking pattern under three contention regimes
 
 The Lock+modify+Unlock cycle behaves very differently depending on
@@ -729,10 +773,32 @@ Readings:
   to beat in pure single-goroutine throughput; `fsync.Queue`
   (8.68 ns) trades that for being unbounded and MPMC-safe.
   Buffered `chan` (17.8 ns) loses to both even here.
-- **Memory** (B/op shown in raw bench output): all queues report
-  **0 allocs/op** thanks to segment amortization (`Queue` allocates
-  one 64-slot segment per 64 elements). The reported `B/op` is the
-  amortized segment cost divided across iterations.
+- **Memory** (per-op): all queues report **0 allocs/op** thanks to
+  segment amortization (`fsync.Queue` allocates one 64-slot
+  segment per 64 elements). For total RAM at steady state, see
+  the footprint table below.
+
+Footprint for 1M `int` items pending in the queue (no dequeue,
+measured via `runtime.ReadMemStats`):
+
+| Implementation                  | RAM       | per item | Heap objects |
+|---------------------------------|----------:|---------:|-------------:|
+| `chan int` (capacity 1M)        |   7.63 MB |    8 B   |          1   |
+| `xsync.SPSCQueue` (cap 1M)      |   7.63 MB |    8 B   |          2   |
+| **`fsync.MutexQueue`**          | **8.58 MB**| **9 B** | **15 626**   |
+| **`fsync.Queue`**               |**10.49 MB**|**11 B** |  **15 626**  |
+| `xsync.MPMCQueue` (cap 1M)      |  68.67 MB |   72 B   |          2   |
+
+`fsync.Queue` is **6.5× lighter than `xsync.MPMCQueue`** (11 vs
+72 B/item) — xsync's Vyukov MPMC bounded queue pads each slot to
+a full cacheline (64 B + an atomic sequence) to avoid false
+sharing between producer and consumer cursors. `fsync.Queue` only
+pads the head/tail segment pointers, so the per-item cost stays
+close to the raw `T` size. `chan` and `xsync.SPSCQueue` are
+single-allocation ring buffers (1–2 heap objects total), so they
+beat fsync's segment-chained design on object count — but they
+are bounded; fsync grows on demand and frees consumed segments
+to the GC.
 
 When to pick which: use `fsync.Queue` when producers and consumers
 both scale and you can't pre-size; use `xsync.SPSCQueue` if you
