@@ -819,7 +819,8 @@ access pattern, so the comparison stays fair.
 
 All bench code lives in `./benchs/` (`fsync_bench_test.go`,
 `gomap_bench_test.go`, `sync_bench_test.go`, `xsync_bench_test.go`,
-`mutexed_bench_test.go`, `queue_bench_test.go`). The standalone
+`mutexed_bench_test.go`, `queue_bench_test.go`,
+`set_bench_test.go`, `bitmap_bench_test.go`). The standalone
 string-hash microbench (maphash vs FNV-1a vs xxh3 vs wyhash) lives
 in `./hashbench/` with its own `go.mod` to keep the parent module
 dependency-free.

@@ -25,8 +25,8 @@ rebuilds (politique « duplicate-on-pin » du Map). Remplace l'idiome canonique
 | Fichier                          | Rôle                                            |
 |----------------------------------|-------------------------------------------------|
 | `store.go`                       | `Store[V]` + `MutexStore[V]`                    |
-| `map.go`                         | `Map[K,V]` (le gros morceau, ~820 l.)            |
-| `set.go`                         | `Set[K]` — spécialisation dédiée (~400 l.) avec son propre `bucketSet[K]` sans `pins` ni `values`, rebuild split-only (pas de duplicate-on-pin car pas de pin) |
+| `map.go`                         | `Map[K,V]` (le gros morceau, ~1060 l.)           |
+| `set.go`                         | `Set[K]` — spécialisation dédiée (~490 l.) avec son propre `bucketSet[K]` sans `pins` ni `values`, rebuild split-only (pas de duplicate-on-pin car pas de pin) |
 | `bitmap.go`                      | `Bitmap` — bit set int64-indexé (~300 l.), même mécanique `bucket / bucketAlloc / Grow` que `Store` mais bucket = `[8]atomic.Uint64` (512 bits = 1 cacheline, 8× moins d'objets heap qu'un bucket à 1 mot) |
 | `queue.go`                       | `Queue[T]` + `MutexQueue[T]` — MPMC FIFO unbounded |
 | `store_test.go`                  | tests séquentiels + concurrents de Store/MutexStore + `LockOrStore` |
@@ -38,10 +38,10 @@ rebuilds (politique « duplicate-on-pin » du Map). Remplace l'idiome canonique
 | `benchs/`                        | sous-package des benchmarks comparatifs         |
 | `README.md`                      | description + tableaux de perf publiables       |
 
-Versionné via git. Branche active : `wip/master-new`. Historiquement versionné
-à la main via des snapshots `map.go.x*` / `store.go.x*` (toujours présents
-dans l'arbre, gitignored, ne pas y toucher sans accord — ce sont les archives
-manuelles de François).
+Versionné via git. Repo unique : `github.com/aytechnet/fsync`
+(branche `main`, dernier tag public : **v0.4.2**). Le monorepo
+DyaPi importe désormais ce module comme une dépendance externe
+standard ; il n'y a plus de sous-répertoire fsync/ dans dyapi.
 
 ## Contrat de concurrence (commun aux 3 structures)
 
@@ -196,20 +196,20 @@ Déclenchée quand `live > 8 * len(buckets) * 3/4` (load factor 0.75).
 
 ### API publique
 ```go
-NewMap[K,V](estimatedItems int) *Map[K,V]
-(*Map[K,V]).Grow(estimatedItems int)
+NewMap[K,V]() *Map[K,V]                             // no-arg since v0.4.0
+(*Map[K,V]).Grow(estimatedItems int) *Map[K,V]      // chainable since v0.3.0
 (*Map[K,V]).Load(k K) (V, bool)
 (*Map[K,V]).Store(k K, v V) (created bool)
 (*Map[K,V]).Delete(k K) bool
 (*Map[K,V]).Lock(k K) (*V, Cursor[K,V], bool)
 (*Map[K,V]).LockOrStore(k K, v V) (*V, Cursor[K,V], created bool)
-(Cursor[K,V]).Unlock()                            // method on cursor
+(Cursor[K,V]).Unlock()                              // method on cursor
 (*Map[K,V]).Len() int
 // sync.Map-style atomic operations (no pin returned):
 (*Map[K,V]).LoadOrStore(k K, v V) (actual V, loaded bool)
 (*Map[K,V]).LoadAndDelete(k K) (V, bool)
 (*Map[K,V]).Swap(k K, v V) (previous V, loaded bool)
-(*Map[K,V]).CompareAndSwap(k K, old, new V) bool   // V interface-comparable
+(*Map[K,V]).CompareAndSwap(k K, old, new V) bool    // V interface-comparable
 (*Map[K,V]).CompareAndDelete(k K, old V) bool       // V interface-comparable
 (*Map[K,V]).Range(f func(K, V) bool)                // weakly consistent
 (*Map[K,V]).Clear()
@@ -269,8 +269,9 @@ Tous tests verts : `go test -count=1 ./...` et `go test -race ./...`.
 
 ## Benchmarks (sous-package `./benchs/`)
 
-5 fichiers : `fsync_bench_test.go`, `gomap_bench_test.go`,
-`sync_bench_test.go`, `xsync_bench_test.go`, `mutexed_bench_test.go`.
+8 fichiers : `fsync_bench_test.go`, `gomap_bench_test.go`,
+`sync_bench_test.go`, `xsync_bench_test.go`, `mutexed_bench_test.go`,
+`queue_bench_test.go`, `set_bench_test.go`, `bitmap_bench_test.go`.
 
 5 workloads : `ReadOnly`, `ReadHeavy` (10:1), `Store`, `GrowStore`, `Churn`
 (Store+Delete sur fenêtre roulante de 1024 clés). + `Lock+inc` pour les
@@ -283,11 +284,14 @@ go test -bench=. -benchtime=5s -count=3 -run='^$' ./benchs/
 ```
 
 Tableaux complets et headline numbers dans `README.md`. Quelques chiffres
-clés (Ryzen 5 8540U, médiane de 3 runs) :
-- `fsync.Store.ReadOnly` : **0.75 ns/op** (plus rapide qu'`xsync.Map` à 1.02 ns).
-- `fsync.Map.ReadOnly` : **1.44 ns/op** (~19 % au-dessus de `map[int]int` sans verrou).
-- `fsync.MutexStore.LockOrStore+inc` : **4.80 ns/op** (vainqueur sur le pattern
-  Lock+inc contendu, devant `xsync.Map[*{mu,v}]` à 7.40 ns).
+clés (Ryzen 5 8540U, médiane de 3 runs, machine idle) :
+- `fsync.Store.ReadOnly` : **0.82 ns/op** (plus rapide qu'`xsync.Map` à 1.04 ns).
+- `fsync.Map.ReadOnly` : **1.40 ns/op** (sous `map[int]int` à 2.11 ns car
+  ce dernier subit le false-sharing sous `RunParallel`).
+- `fsync.MutexStore.LockOrStore+inc` : **5.24 ns/op** (vainqueur sur le pattern
+  Lock+inc contendu, devant `xsync.Map[*{mu,v}]` à 7.60 ns).
+- `fsync.Bitmap.Has` : **0.52 ns/op** — record du package sur le lookup.
+- `fsync.Queue.MPMC` : **32.1 ns/op** — 4.4× plus rapide que `xsync.MPMCQueue`.
 
 ## État actuel
 
