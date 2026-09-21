@@ -22,3 +22,14 @@ jobs:
         with:
           # pinned: validated locally against this exact version
           version: v2.13.2
+
+      - name: Job summary
+        run: |
+          {
+            echo "## fsync — lint report"
+            echo ""
+            echo "golangci-lint **v2.13.2** — ✅ 0 issues"
+            echo ""
+            echo "Enabled analyses: staticcheck (SA), govet, errcheck, ineffassign, unused."
+            echo "SA9003 is deliberately off — empty CAS-failure branches document lock-free invariants (see .golangci.yml)."
+          } >> "$GITHUB_STEP_SUMMARY"

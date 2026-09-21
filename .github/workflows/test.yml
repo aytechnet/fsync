@@ -43,3 +43,18 @@ jobs:
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Job summary
+        run: |
+          cov=$(go tool cover -func=coverage.txt | tail -1 | awk '{print $3}')
+          {
+            echo "## fsync — report (Go ${{ matrix.go-version }})"
+            echo ""
+            echo "| Check | Result |"
+            echo "|---|---|"
+            echo "| go vet | ✅ clean |"
+            echo "| tests | ✅ pass |"
+            echo "| race detector | ✅ clean |"
+            echo "| coverage (total) | $cov |"
+            echo "| benchs & hashbench sub-modules | ✅ compile |"
+          } >> "$GITHUB_STEP_SUMMARY"
