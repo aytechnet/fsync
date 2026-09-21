@@ -994,8 +994,7 @@ func (m *Map[K, V]) migrateBucket(t, nt *tableMap[K, V], idx uint64, b *bucketMa
 	// the state==Open check must finish its in-bucket work (under
 	// b.mu) before we read its tags & pins below.
 	b.mu.Lock()
-	//lint:ignore SA2001 the Lock/Unlock pair is a barrier, not a real critical section
-	b.mu.Unlock()
+	b.mu.Unlock() //nolint:staticcheck // SA2001: the Lock/Unlock pair is a barrier, not a real critical section
 
 	// check pin state across the whole chain (only the low 8 pin bits matter;
 	// the high 56 bits hold the seq and are always non-zero after the first

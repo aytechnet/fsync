@@ -347,6 +347,6 @@ après le premier commit, critère bloquant awesome-go).
 - Avant de soumettre, revérifier :
   - pkg.go.dev répond 200 sur
     https://pkg.go.dev/github.com/aytechnet/fsync ;
-  - Go Report Card affiche toujours A+ ;
+  - le workflow `lint` (golangci-lint, remplace le Go Report Card disparu en 2026) est vert ;
   - Codecov affiche la couverture à jour ;
   - position alphabétique encore correcte dans la rubrique Maps.

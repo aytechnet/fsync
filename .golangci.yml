@@ -1,0 +1,25 @@
+version: "2"
+run:
+  timeout: 3m
+linters:
+  settings:
+    staticcheck:
+      # SA analyses only (ST/QF style classes left for a dedicated cleanup pass).
+      # SA9003 (empty branch) is off: this lock-free codebase deliberately keeps
+      # empty CAS-failure branches to document invariants in place (15+ sites in
+      # store.go/bitmap.go — see "Invariant:" comments).
+      checks:
+        - all
+        - -ST*
+        - -QF*
+        - -SA9003
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+formatters:
+  exclusions:
+    generated: lax

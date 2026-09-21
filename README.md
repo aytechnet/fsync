@@ -3,7 +3,7 @@
 [![ci](https://github.com/aytechnet/fsync/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/aytechnet/fsync/actions/workflows/test.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/aytechnet/fsync.svg)](https://pkg.go.dev/github.com/aytechnet/fsync)
 [![Go Coverage](https://img.shields.io/codecov/c/github/aytechnet/fsync/main?color=brightcolor)](https://codecov.io/gh/aytechnet/fsync)
-[![Go Report Card](https://goreportcard.com/badge/github.com/aytechnet/fsync)](https://goreportcard.com/report/github.com/aytechnet/fsync)
+[![lint](https://github.com/aytechnet/fsync/actions/workflows/lint.yml/badge.svg?branch=main)](https://github.com/aytechnet/fsync/actions/workflows/lint.yml)
 
 `fsync` is a Go 1.25 library of high-performance, generic concurrent
 containers — drop-in replacements for `sync.Map`, `map[K]V + mutex`,
@@ -69,8 +69,8 @@ seen.Range(func(i int64) bool { /* … */ ; return true })
   signatures and semantics. Plus a runtime `Grow(n)` you don't get
   from `sync.Map` or `xsync.Map` (chainable).
 - **Production-tested.** Backs the `aytechnet/dyapi` iPaaS platform
-  in production. 89 % test coverage, race-detector clean, A+ on Go
-  Report Card.
+  in production. 89 % test coverage, race-detector clean, linted in
+  CI with golangci-lint (staticcheck, govet, errcheck).
 
 For a per-container deep dive — concurrency contract, race-detector
 caveat with inline `V`, design history, and the full benchmark

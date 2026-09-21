@@ -434,8 +434,7 @@ func (s *Set[K]) migrateBucket(t, nt *tableSet[K], idx uint64, b *bucketSet[K]) 
 	// state==Open check must finish its in-bucket work (under b.mu)
 	// before we read its tags below.
 	b.mu.Lock()
-	//lint:ignore SA2001 the Lock/Unlock pair is a barrier, not a real critical section
-	b.mu.Unlock()
+	b.mu.Unlock() //nolint:staticcheck // SA2001: the Lock/Unlock pair is a barrier, not a real critical section
 
 	b0 := &bucketSet[K]{}
 	b1 := &bucketSet[K]{}
