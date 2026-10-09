@@ -303,9 +303,10 @@ Tous tests verts : `go test -count=1 ./...` et `go test -race ./...`.
 
 ## Benchmarks (sous-package `./benchs/`)
 
-8 fichiers : `fsync_bench_test.go`, `gomap_bench_test.go`,
+10 fichiers : `fsync_bench_test.go`, `gomap_bench_test.go`,
 `sync_bench_test.go`, `xsync_bench_test.go`, `mutexed_bench_test.go`,
-`queue_bench_test.go`, `set_bench_test.go`, `bitmap_bench_test.go`.
+`queue_bench_test.go`, `set_bench_test.go`, `bitmap_bench_test.go`,
+`bloom_bench_test.go`, `interner_bench_test.go`.
 
 5 workloads : `ReadOnly`, `ReadHeavy` (10:1), `Store`, `GrowStore`, `Churn`
 (Store+Delete sur fenêtre roulante de 1024 clés). + `Lock+inc` pour les

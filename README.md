@@ -8,9 +8,9 @@
 `fsync` is a Go 1.25 library of high-performance, generic concurrent
 containers — drop-in replacements for `sync.Map`, `map[K]V + mutex`,
 buffered `chan`, bitsets, Bloom filters and interners. Built for the
-DyaPi iPaaS platform; eight containers, one set of guarantees: lock-free reads, zero-allocation
-hot paths, full `sync.Map`-compatible API, plus a stable `*V` pointer
-out of `Lock`.
+DyaPi iPaaS platform; eight containers, one set of guarantees:
+lock-free reads, zero-allocation hot paths, full `sync.Map`-compatible
+API, plus a stable `*V` pointer out of `Lock`.
 
 ## At a glance
 
@@ -49,6 +49,19 @@ var seen fsync.Bitmap
 seen.Set(42)
 seen.Has(42)            // true
 seen.Range(func(i int64) bool { /* … */ ; return true })
+
+// Bloom: "seen before?" in ~1.5 B/key at 1 % false positives.
+// Add reports a key as new at most once, even under concurrent Adds.
+visitors := fsync.NewBloom[uint64](50_000, 0.01)
+h := uint64(0x9E3779B97F4A7C15) // e.g. a salted visitor hash
+if visitors.Add(h) { /* first visit today */ }
+visitors.Reset()        // at the end of the period
+
+// Interner: key ↔ dense int64 id (1, 2, 3…), both ways.
+paths := fsync.NewInterner[string]()
+id, created := paths.Intern("/shoes/running") // 1, true
+paths.Lookup("/shoes/running")                 // 1 (0 = never interned)
+k, _ := paths.Key(id)                          // "/shoes/running"
 ```
 
 ## Why fsync?
@@ -66,12 +79,17 @@ seen.Range(func(i int64) bool { /* … */ ; return true })
   granularity. `Bitmap` packs 1 M bits in **~145 KB** (vs ~48 MB for
   `xsync.Map[int64, bool]`); `Set` is a zero-runtime-cost wrapper
   on `Map[K, struct{}]`. Detailed footprint table further down.
+- **Probabilistic and dictionary structures.** `Bloom` answers
+  "seen before?" in **1.5 B/key** at 1 % false positives (vs 44 B/key
+  for `Set`), with one atomic OR per `Add`. `Interner` maps keys to
+  dense ids both ways in **34 B/key**, lock-free on reads, with
+  parallel inserts — ids that can then index a `Store` or a `Bitmap`.
 - **`sync.Map`-compatible.** `LoadOrStore`, `Swap`, `CompareAndSwap`,
   `CompareAndDelete`, `LoadAndDelete`, `Range`, `Clear`: same
   signatures and semantics. Plus a runtime `Grow(n)` you don't get
   from `sync.Map` or `xsync.Map` (chainable).
 - **Production-tested.** Backs the `aytechnet/dyapi` iPaaS platform
-  in production. 89 % test coverage, race-detector clean, linted in
+  in production. 91.6 % test coverage, race-detector clean, linted in
   CI with golangci-lint (staticcheck, govet, errcheck).
 
 For a per-container deep dive — concurrency contract, race-detector
@@ -923,7 +941,8 @@ access pattern, so the comparison stays fair.
 All bench code lives in `./benchs/` (`fsync_bench_test.go`,
 `gomap_bench_test.go`, `sync_bench_test.go`, `xsync_bench_test.go`,
 `mutexed_bench_test.go`, `queue_bench_test.go`,
-`set_bench_test.go`, `bitmap_bench_test.go`). The standalone
+`set_bench_test.go`, `bitmap_bench_test.go`, `bloom_bench_test.go`,
+`interner_bench_test.go`). The standalone
 string-hash microbench (maphash vs FNV-1a vs xxh3 vs wyhash) lives
 in `./hashbench/` with its own `go.mod` to keep the parent module
 dependency-free.
@@ -1011,7 +1030,7 @@ to document the tradeoffs that shaped the current implementation, and
 to spare a future contributor the cost of re-exploring an idea that
 was already benched and rejected.
 
-### Hash map architecture — three successive designs for `Map[K,V]`
+### Hash map architecture — four successive designs for `Map[K,V]`
 
 1. **Slot+chain head table** (May 2026, abandoned). Open addressing
    with chained slots via a delta-encoded `iln` field; heads on odd
