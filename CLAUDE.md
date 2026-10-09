@@ -3,7 +3,7 @@
 Package `github.com/aytechnet/fsync` : alternatives concurrentes plus rapides que
 `sync.Map` / `puzpuzpuz/xsync` pour la plateforme iPaaS DyaPi. Go 1.25.
 
-Six structures, six niches :
+Huit structures, huit niches :
 
 | Type            | Clé             | Valeur (inline)            | Niche                                  |
 |-----------------|------------------|----------------------------|----------------------------------------|
@@ -13,11 +13,14 @@ Six structures, six niches :
 | `Set[K]`        | `K comparable`   | `[8]K` par bucket (sans `pins`, sans `values`) | spécialisation dédiée — ~13 % plus léger que `Map[K, struct{}]` |
 | `Bitmap`        | `int64`          | `[8]atomic.Uint64` (512 bits = 1 cacheline) | bit set dense, ~10× plus léger que `Store[bool]`, ~340× plus léger que `xsync.Map[int64, bool]` |
 | `Queue[T]`      | —                | `[64]T` par segment        | MPMC FIFO unbounded lock-free          |
+| `Bloom[K]`      | `K comparable`   | `[]atomic.Uint64`, un mot par clé | filtre de Bloom lock-free, « déjà vu ? » probabiliste, ~1,5 o/clé à 1 % |
+| `Interner[K]`   | `K comparable`   | table à adressage ouvert `[]atomic.Uint64` + clés par segments | clé ↔ identifiant `int64` dense (1, 2, 3…), dans les deux sens, ~34 o/clé |
 
 Différenciateur central : **`Lock(k)` renvoie un `*V` stable** vers la valeur
 stockée *inline* dans le container. Pas d'allocation d'`*Entry`, pas
 d'indirection — la cellule du bucket *est* l'entrée. Le pin survit aux
-rebuilds (politique « duplicate-on-pin » du Map). Remplace l'idiome canonique
+rebuilds (politique « skip-on-pin » du Map depuis v0.5.0 : un bucket épinglé
+n'est pas migré tant que le pin tient). Remplace l'idiome canonique
 `map[K]*Entry{mu, v}`.
 
 ## Vue d'ensemble du code
@@ -28,12 +31,17 @@ rebuilds (politique « duplicate-on-pin » du Map). Remplace l'idiome canonique
 | `map.go`                         | `Map[K,V]` (le gros morceau, ~1060 l.)           |
 | `set.go`                         | `Set[K]` — spécialisation dédiée (~490 l.) avec son propre `bucketSet[K]` sans `pins` ni `values`, rebuild split-only (pas de duplicate-on-pin car pas de pin) |
 | `bitmap.go`                      | `Bitmap` — bit set int64-indexé (~300 l.), même mécanique `bucket / bucketAlloc / Grow` que `Store` mais bucket = `[8]atomic.Uint64` (512 bits = 1 cacheline, 8× moins d'objets heap qu'un bucket à 1 mot) |
+| `bloom.go`                       | `Bloom[K]` — filtre de Bloom « word-blocked » (~260 l.) : les k bits d'une clé dans UN mot de 64 bits → `Add` = un `Or` atomique (au plus un `added=true` par clé entre `Add` concurrents), `Contains` = un `Load` ; taille fixe calculée par le modèle bloqué (Poisson), `Reset` par échange atomique de table |
+| `interner.go`                    | `Interner[K]` (~270 l.) — structure dédiée, PAS un `Map` : table à adressage ouvert de mots 64 bits (empreinte 24 bits + id 40 bits, aucune clé dans la table, sondage linéaire, charge ≤ 0,7) + clés stockées UNE fois dans des segments doublants indexés par id (bit « publié » par id) ; mot publié immuable ⇒ lecture sans seqlock ; insertion = CAS de réservation (empreinte, id 0) → `next.Add` → écriture de la clé → publication de l'id ; doublement sous `RWMutex` (insertions seulement). Remplace la 1re version sur `Map`+`Store` : 99 → 34 o/clé, nouvelle clé 413 → 120 ns |
 | `queue.go`                       | `Queue[T]` + `MutexQueue[T]` — MPMC FIFO unbounded |
 | `store_test.go`                  | tests séquentiels + concurrents de Store/MutexStore + `LockOrStore` |
 | `map_test.go`, `map_concur_test.go` | tests `Map` (séquentiel, rebuild, pins, concurrent) |
 | `map_load_during_lock_test.go`   | test `Load` pendant `Lock` (build tag `!race`)  |
 | `set_test.go`                    | tests `Set` (séquentiel + concurrent)            |
 | `bitmap_test.go`                 | tests `Bitmap` (basic, start offset, cross-bucket, Toggle, Grow, big concurrent) |
+| `bloom_test.go`                  | tests `Bloom` (basic/zero value, pas de faux négatif + taux de faux positifs mesuré, EstimatedLen, clés string, dimensionnement, `Add` concurrents une seule fois par clé, `Reset` concurrent) |
+| `interner_test.go`               | tests `Interner` (basic/zero value, ids denses + Range, un seul id et un seul `created` par clé en concurrence, lecteurs concurrents : tout id vu par `Lookup` se résout par `Key`) |
+| `map_rebuild_pinned_test.go`     | régression `Map` : slot épinglé pendant un doublement concurrent (bucket dupliqué compté une seule fois, aucune case nil, aucune perte) |
 | `concur_test.go`                 | tests croisés                                   |
 | `benchs/`                        | sous-package des benchmarks comparatifs         |
 | `README.md`                      | description + tableaux de perf publiables       |
@@ -144,27 +152,53 @@ type Map[K,V] struct {
 ### Pin / seq dans `pins atomic.Uint64`
 - 8 bits pin (un par slot) en bas, compteur monotone 56 bits (seq) en haut.
 - `Lock` / `Unlock` incrémentent `seq` en plus de toggler le bit.
-- `Load` utilise le pattern seqlock : observe `pinsStart` (bit clair), lit
-  `values[j]`, ré-observe `pinsEnd` ; égal ⇒ pas de Lock/Unlock pendant la
-  lecture ⇒ pas de torn-read. Si le bit est positionné, `runtime.Gosched`
-  puis retry.
+- `Load` utilise le pattern seqlock **sur toute la fenêtre** (v0.5.0) :
+  lit `pinsStart` AVANT le tag scan et la comparaison de clé, lit
+  `values[j]`, ré-observe `pins` ; égal ⇒ ni écriture ni suppression
+  pendant la lecture. Bit positionné ⇒ `runtime.Gosched` puis on refait
+  toute la fenêtre (le slot a pu disparaître).
+- **Tout écrivain de clé/valeur in-place passe par le même protocole
+  pin+seq** (`pinSlot`/`unpinSlot`) : mise à jour de `Store`, `Delete`,
+  `deleteIf` (le pin est pris AVANT de lire la valeur). Avant v0.5.0, la
+  mise à jour de `Store` écrivait sans seq ⇒ `Load` renvoyait des valeurs
+  multi-mots déchirées (~300 k en 2 s mesurés) — et DyaPi écrase des
+  `Licence` (interface) par `Store`.
+- `Lock` (sans mutex de bucket) **revalide après le CAS du pin** : bucket
+  `Open`, tag et clé toujours là ; sinon il relâche et recommence. Sans
+  cela, il pouvait épingler un slot qu'un `Delete` venait de libérer, ou un
+  bucket gelé en cours de copie (écriture par `*V` perdue).
+- Les chemins d'insertion ne réutilisent pas un slot libre encore épinglé.
+- `Range` lit chaque paire (clé, valeur) sous le même seqlock.
 
 ### États de bucket
 - `bucketOpen` (0) : accepte inserts/updates.
 - `bucketFrozen` (1) : claimé par un migrateur (split classique en cours).
 - `bucketMoved` (2) : migration finie ; lecteurs basculent sur `nextTable`.
 
-### Politique de rebuild « split-or-duplicate »
+### Politique de rebuild « split, skip-on-pin » (v0.5.0)
 Déclenchée quand `live > 8 * len(buckets) * 3/4` (load factor 0.75).
 
-- **Split** (cas usuel) : bucket sans pin ⇒ deux nouveaux buckets dans
-  `nextTable` selon le nouveau bit du masque. L'ancien passe `Moved`.
-- **Duplicate** : bucket avec au moins un pin ⇒ **même pointeur** publié
-  dans les deux entrées de `nextTable`. Le bucket reste vivant à son
-  adresse d'origine ⇒ le `*V` rendu par `Lock` reste valide. Tag scan
-  lit jusqu'aux 8 slots des deux côtés ; la comparaison de clé
-  désambiguïse. État laissé à `Open` (pas `Moved` : les pins doivent
-  pouvoir continuer à modifier).
+- **Split** : bucket sans pin ⇒ deux nouveaux buckets dans `nextTable`
+  selon le nouveau bit du masque. L'ancien passe `Moved`.
+- **Skip** : bucket avec au moins un pin ⇒ **non migré**, laissé `Open`
+  dans l'ancienne table (lectures/écritures continuent dessus, le `*V`
+  reste valide). Le sweep **cyclique** (`rebuildIdx % heads`) y revient ;
+  `nextTable` n'est promue que quand toutes les positions sont migrées.
+  Un pin tenu longtemps **retarde** donc la fin du doublement, jamais la
+  correction.
+- **Une position = une migration** : garde `nt.buckets[idx] != nil`, donc
+  `rebuildLeft` décrémenté exactement une fois par position.
+- `afterInsert` aide aussi le rebuild de la **table courante** : une fois
+  la plupart des buckets migrés, les inserts tombent dans `nextTable` et
+  une position sautée ne serait plus jamais revisitée.
+- **Historique** : jusqu'à v0.4.3, politique « duplicate-on-pin » (même
+  pointeur publié aux deux positions, état remis `Open`). Deux défauts
+  trouvés le 09/10/2026 : (1) un helper qui attendait `Frozen` remigrait
+  le bucket dupliqué ⇒ `rebuildLeft` décrémenté deux fois ⇒ promotion
+  avec des cases `nil` ⇒ panique dans `Load` ; (2) un bucket partagé ne
+  pouvait plus être éclaté correctement ⇒ chaînes illimitées (2 344
+  buckets mesurés). Tests : `map_rebuild_pinned_test.go`,
+  `map_rebuild_skip_test.go`, `map_seqlock_test.go`.
 
 ### Sweep lazy + helping
 - **Rebuild collaboratif** : chaque `Store`, `LockOrStore` (création) et

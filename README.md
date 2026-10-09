@@ -7,8 +7,8 @@
 
 `fsync` is a Go 1.25 library of high-performance, generic concurrent
 containers — drop-in replacements for `sync.Map`, `map[K]V + mutex`,
-buffered `chan`, and bitsets. Built for the DyaPi iPaaS platform; six
-containers, one set of guarantees: lock-free reads, zero-allocation
+buffered `chan`, bitsets, Bloom filters and interners. Built for the
+DyaPi iPaaS platform; eight containers, one set of guarantees: lock-free reads, zero-allocation
 hot paths, full `sync.Map`-compatible API, plus a stable `*V` pointer
 out of `Lock`.
 
@@ -22,6 +22,8 @@ out of `Lock`.
 | `MutexStore[V]` | `int64`          | inline `[64]V`  | same, mutex per slot (contention)      |
 | `Bitmap`        | `int64`          | `[8]atomic.Uint64` (512 bits / cacheline) | dense bit set (~10× lighter than `Store[bool]`) |
 | `Queue[T]`      | —                | inline `[64]T`  | unbounded MPMC FIFO, lock-free         |
+| `Bloom[K]`      | `K comparable`   | `[]atomic.Uint64`, one word per key | probabilistic "seen before?", ~1.5 B/key at 1 % FP |
+| `Interner[K]`   | `K comparable`   | open-addressing `[]atomic.Uint64` + segmented keys | key ↔ dense `int64` id (1, 2, 3…), both ways, ~34 B/key |
 
 ## Quick start
 
@@ -152,9 +154,10 @@ detected at runtime.
 After Unlock, the slot may be overwritten by a concurrent
 `Store`, zeroed by a concurrent `Delete`, or (during a rebuild)
 still point into the old bucket while readers have switched to
-the new one. Never dereference `p` after `Unlock`. The
-duplicate-on-pin rebuild policy guarantees the address stays
-valid **while** pinned — that guarantee ends at Unlock.
+the new one. Never dereference `p` after `Unlock`. A pinned
+bucket is never moved by a rebuild (skip-on-pin), so the address
+stays valid **while** pinned — that guarantee ends at Unlock. A
+Lock held for long only delays the end of a table doubling.
 
 **5. `LoadOrStore` / `Swap` / `CompareAndSwap` give you
 sync.Map-style atomic ops without a holdable lock.**
@@ -718,6 +721,106 @@ exchange for ~3× faster write-then-clear churn cycles. Use
 across the int64 range AND you can't afford the virtual address
 reservation that `Bitmap.Grow` makes.
 
+### `Bloom[K]` — lock-free concurrent Bloom filter
+
+`Bloom[K]` answers "have I seen this key before?" with no false
+negatives and a bounded false-positive rate, in a fraction of the
+memory of an exact set. It is **word-blocked**: all `k` bits of a key
+live in one 64-bit word chosen by its hash, so `Add` is a single
+`atomic.Uint64.Or` and `Contains` a single `Load` — one cache line per
+call, no lock, no allocation. This costs ~20 % more memory than a
+classic filter for the same rate, and buys an **exact concurrent
+contract**: among concurrent `Add`s of the same key, at most one
+returns `added = true`, so `Add` doubles as a race-free "first time?"
+test (e.g. counting first visits, deduplicating events).
+
+The filter has a fixed capacity: size it with `NewBloom(expected,
+fpRate)` (the word count and `k` are chosen from the word-blocked
+model), watch `Saturation` / `EstimatedLen`, and `Reset` it at the end
+of its period. `Reset` swaps in a fresh table atomically, so an `Add`
+racing with it lands wholly in the old or the new table. The zero
+value is usable (sized for 4096 keys at 1 %).
+
+API:
+
+```go
+NewBloom[K](expectedItems int, fpRate float64) *Bloom[K]
+(*Bloom[K]).Add(k K) (added bool)   // true = (probably) new
+(*Bloom[K]).Contains(k K) bool      // false = certainly absent
+(*Bloom[K]).Reset()
+(*Bloom[K]).Saturation() float64    // fraction of bits set
+(*Bloom[K]).EstimatedLen() int
+(*Bloom[K]).Cap() int
+(*Bloom[K]).Bytes() int
+```
+
+Measured (Ryzen 5 8540U, 12 threads; `benchs/bloom_bench_test.go`):
+
+| Structure (1M int keys) | Footprint   | Add (parallel) | Contains (parallel) |
+|-------------------------|------------:|---------------:|--------------------:|
+| **`fsync.Bloom` 1 %**   | **1.5 MB** (1.53 B/key) | **3.1 ns** | **1.35 ns** |
+| `fsync.Bloom` 0.1 %     | 2.9 MB (2.92 B/key) | — | — |
+| `fsync.Set[int]`        | 44.4 MB (44.4 B/key) | 57.3 ns | 6.25 ns |
+| `map[int]struct{}` + `Mutex` | 47.4 MB (47.4 B/key) | 195 ns | — |
+
+Measured false-positive rates at capacity (`bloom_test.go`): 0.96 %
+for a 1 % target, 0.106 % for 0.1 %, with ~0.38 / 0.28 of the bits set.
+
+### `Interner[K]` — concurrent key ↔ dense int64 id
+
+`Interner[K]` gives each distinct key a dense, strictly positive
+`int64` id (1, 2, 3…) and translates both ways — the "dictionary
+encoding" of columnar stores and the symbol table of compilers. Rust's
+`lasso::ThreadedRodeo` is the closest equivalent; Go's `unique`
+package interns to canonical handles, not to integers. The ids are
+meant to index a `Store` or a `Bitmap`, or to replace a long key in a
+serialized record.
+
+Guarantees, for any number of goroutines: concurrent `Intern`s of the
+same key get the same id and exactly one reports `created`; ids are
+dense (`1..Len()`, none burnt by a lost race); `Key(id)` succeeds for
+any id obtained from `Intern` or `Lookup` (the reverse entry is
+written first); ids are never reassigned (no `Delete`). `0` is never
+an id: `Lookup` returns `0` for an unknown key.
+
+It is a dedicated structure, not a `Map`: an append-only dictionary
+needs neither pins, nor deletes, nor value updates. An **open-addressing
+table of 64-bit words** packs a 24-bit hash fingerprint and a 40-bit id
+— no key in the table — and the keys are stored **once**, in a
+segmented dense array indexed by id, which is also the id → key
+direction. A published word never changes, so lookups need no seqlock;
+an insert reserves an empty word with one CAS, draws the id, writes the
+key, then publishes the id, so inserts of different keys run in
+parallel. Only a table doubling (rare, amortized) excludes inserts,
+through an `RWMutex` that lookups never touch.
+
+```go
+NewInterner[K]() *Interner[K]
+(*Interner[K]).Grow(estimatedItems int) *Interner[K]
+(*Interner[K]).Intern(k K) (id int64, created bool)
+(*Interner[K]).Lookup(k K) int64        // 0 = never interned
+(*Interner[K]).Key(id int64) (K, bool)
+(*Interner[K]).Len() int
+(*Interner[K]).Range(f func(id int64, k K) bool)   // id order
+```
+
+Measured (Ryzen 5 8540U, 12 threads; `benchs/interner_bench_test.go`).
+Against `map[string]int64` + `[]string` under a `sync.RWMutex`, 65 536
+string keys:
+
+| Operation              | `fsync.Interner` | map + RWMutex |
+|------------------------|-----------------:|--------------:|
+| Intern, new key        | **120 ns**       | 390 ns        |
+| Intern, existing key   | **3.3 ns**       | 40 ns         |
+| Key (id → key)         | **0.55 ns**      | 29 ns         |
+| Lookup, 1M keys, random (hit / miss) | **22.6 / 22.8 ns** | — |
+
+Footprint (string keys, excluding the string bytes themselves):
+**34 B/key** at 1M keys, 44 B/key at 100k — against 99 B/key for the
+first implementation built on `Map[K,int64]` + `Store[K]` (which also
+stored every key twice), and 77 B/key for `map[string]int64` +
+`[]string`.
+
 ### `Queue[T]` and `MutexQueue[T]` — unbounded MPMC FIFO
 
 `Queue[T]` is a lock-free multi-producer / multi-consumer FIFO built
@@ -931,7 +1034,7 @@ was already benched and rejected.
    correct but layered — every op paid a `Store[V]` indirection on
    top of the bucket map.
 
-3. **Bucket-direct, duplicate-on-pin** (current). Heavily inspired by
+3. **Bucket-direct, duplicate-on-pin** (v0.1 – v0.4.3). Heavily inspired by
    `puzpuzpuz/xsync`: each bucket holds `[8]V` inline alongside
    `[8]K`, eight `h7` tag bytes packed in `meta`, and a
    `pins/seq` word. Rebuild **splits** a bucket when no pin is
@@ -940,6 +1043,19 @@ was already benched and rejected.
    addresses handed out by `Lock` survive resizes. Convergence is
    guaranteed by construction: no migration of values, only of
    bucket pointers.
+
+4. **Bucket-direct, skip-on-pin** (current, v0.5.0). Two defects of
+   duplicate-on-pin surfaced under stress: a helper waiting on a
+   frozen bucket could re-migrate a duplicated one (rebuild counted
+   twice, table promoted with nil slots → panic), and a shared
+   bucket could not be split correctly later (unbounded chains).
+   A pinned bucket is now simply **skipped**: it stays open in the
+   old table, the cyclic sweep comes back to it, and the new table
+   is promoted once every position is migrated. In the same
+   release, every in-place write of a slot (Store update, Delete)
+   goes through the pin+seq protocol and `Lock` re-validates the
+   slot after pinning: before, `Load` could return a torn
+   multi-word `V` while `Store` overwrote it.
 
 ### Cursor / Unlock evolution
 
@@ -952,8 +1068,7 @@ was already benched and rejected.
   `Unlock`s removed.
 - **v2:** cursors hold `*bucket` directly instead of `(*store, i)`.
   Buckets are never relocated (the Store/MutexStore resize logic
-  has this invariant already, and Map's duplicate-on-pin keeps it
-  too), so the cursor's only job — releasing the pin — does not
+  has this invariant already, and Map never moves a pinned bucket), so the cursor's only job — releasing the pin — does not
   need a table walk anymore. `cur.Unlock()` becomes one atomic
   `And`/`mutex.Unlock` with zero lookups.
 
