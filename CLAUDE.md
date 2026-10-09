@@ -32,7 +32,7 @@ n'est pas migré tant que le pin tient). Remplace l'idiome canonique
 |----------------------------------|-------------------------------------------------|
 | `store.go`                       | `Store[V]` + `MutexStore[V]`                    |
 | `map.go`                         | `Map[K,V]` (le gros morceau, ~1060 l.)           |
-| `set.go`                         | `Set[K]` — spécialisation dédiée (~490 l.) avec son propre `bucketSet[K]` sans `pins` ni `values`, rebuild split-only (pas de duplicate-on-pin car pas de pin) |
+| `set.go`                         | `Set[K]` — spécialisation dédiée (~520 l.) avec son propre `bucketSet[K]` sans `pins` ni `values`, mais un `seq` 32 bits par nœud (v0.5.0, logé dans le padding après `state` : taille de bucket inchangée) que seul `Remove` incrémente ; `Contains`/`Range` copient la clé, valident `seq`, puis comparent ; rebuild split-only (pas de pin) |
 | `bitmap.go`                      | `Bitmap` — bit set int64-indexé (~300 l.), même mécanique `bucket / bucketAlloc / Grow` que `Store` mais bucket = `[8]atomic.Uint64` (512 bits = 1 cacheline, 8× moins d'objets heap qu'un bucket à 1 mot) |
 | `bloom.go`                       | `Bloom[K]` — filtre de Bloom « word-blocked » (~260 l.) : les k bits d'une clé dans UN mot de 64 bits → `Add` = un `Or` atomique (au plus un `added=true` par clé entre `Add` concurrents), `Contains` = un `Load` ; taille fixe calculée par le modèle bloqué (Poisson), `Reset` par échange atomique de table |
 | `interner.go`                    | `Interner[K]` (~270 l.) — structure dédiée, PAS un `Map` : table à adressage ouvert de mots 64 bits (empreinte 24 bits + id 40 bits, aucune clé dans la table, sondage linéaire, charge ≤ 0,7) + clés stockées UNE fois dans des segments doublants indexés par id (bit « publié » par id) ; mot publié immuable ⇒ lecture sans seqlock ; insertion = CAS de réservation (empreinte, id 0) → `next.Add` → écriture de la clé → publication de l'id ; doublement sous `RWMutex` (insertions seulement). Remplace la 1re version sur `Map`+`Store` : 99 → 34 o/clé, nouvelle clé 413 → 120 ns |
@@ -160,6 +160,14 @@ type Map[K,V] struct {
   `values[j]`, ré-observe `pins` ; égal ⇒ ni écriture ni suppression
   pendant la lecture. Bit positionné ⇒ `runtime.Gosched` puis on refait
   toute la fenêtre (le slot a pu disparaître).
+- **Règle de lecture : copier, valider, PUIS utiliser.** Un lecteur ne
+  compare jamais `cur.keys[j]` en place : il copie la clé, revérifie
+  `pins` (ou `seq` pour `Set`), et seulement alors la compare. Une clé
+  multi-mots (`string`) réécrite en concurrence pourrait sinon être
+  déréférencée déchirée (pointeur `nil` + longueur ⇒ faute fatale).
+  S'applique à `Map.Load`, `Map.Lock` (avant le CAS), `Map.Range`,
+  `Set.Contains`, `Set.Range`. Les écrivains comparent sous `b.mu`, où
+  aucune clé ne bouge.
 - **Tout écrivain de clé/valeur in-place passe par le même protocole
   pin+seq** (`pinSlot`/`unpinSlot`) : mise à jour de `Store`, `Delete`,
   `deleteIf` (le pin est pris AVANT de lire la valeur). Avant v0.5.0, la

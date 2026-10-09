@@ -91,7 +91,7 @@ k, _ := paths.Key(id)                          // "/shoes/running"
   signatures and semantics. Plus a runtime `Grow(n)` you don't get
   from `sync.Map` or `xsync.Map` (chainable).
 - **Production-tested.** Backs the `aytechnet/dyapi` iPaaS platform
-  in production. 91.6 % test coverage, race-detector clean, linted in
+  in production. 94.3 % test coverage, race-detector clean, linted in
   CI with golangci-lint (staticcheck, govet, errcheck).
 
 For a per-container deep dive — concurrency contract, race-detector
@@ -566,12 +566,17 @@ Highlights:
 
 `Set[K]` is a dedicated specialization (not a wrapper) with its own
 `bucketSet[K]` layout: 8 inline `K` slots, one `meta atomic.Uint64`
-packing 8 h7 tags, and a writer mutex. **No `pins` word, no
-`values` array, no seqlock pattern** — the key alone *is* the
-entry, and the meta tag scan + key compare is the entire Contains
-hot path. Compared to a `Map[K, struct{}]` wrapper, this drops 8
-bytes per bucket (the unused `pins` word) and shaves the seqlock
-overhead the generic Map carries to support `Lock(*V)`.
+packing 8 h7 tags, a 32-bit per-node `seq`, and a writer mutex.
+**No `pins` word, no `values` array** — the key alone *is* the entry.
+The `seq` (since v0.5.0) is a minimal seqlock that only `Remove`
+bumps: `Contains` and `Range` copy a key, check `seq`, and only then
+compare or yield it, so a multi-word key (a `string`) being zeroed is
+never dereferenced half-written — before, `Range` yielded torn or
+zeroed strings under a concurrent `Remove`. The 32-bit `seq` lives in
+the padding after `state`: the bucket keeps its size class (96 B for
+`Set[int]`). Compared to a `Map[K, struct{}]` wrapper, this still
+drops the `pins` word and the pin protocol the generic Map carries to
+support `Lock(*V)`.
 
 API (zero value usable):
 
@@ -619,7 +624,7 @@ Readings:
 - **vs `fsync.Map[K, struct{}]`:** Set is ~6 % faster on Add,
   ~8 % faster on Contains, **13 % less RAM** (no `pins` word in
   the bucket). The specialization is small but real — Map's
-  seqlock and pin word are dead weight in the Set use case.
+  pin word and pin protocol are dead weight in the Set use case.
 - **vs `xsync.Map[K, struct{}]`:** Set saves **1 alloc per
   insert** (Add 52 vs 80 ns) and is 15 % lighter on RAM. xsync
   still wins Contains (0.93 vs 1.36 ns) thanks to a tighter

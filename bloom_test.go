@@ -185,3 +185,80 @@ func TestBloomConcurrentResetNoPanic(t *testing.T) {
 		t.Errorf(`Reset must keep the capacity: Cap() = %d`, b.Cap())
 	}
 }
+
+func TestBloomKeyTypes(t *testing.T) {
+	type pair struct{ a, b int }
+	b64 := NewBloom[int64](500, 0.01)
+	bu := NewBloom[uint](500, 0.01)
+	b32 := NewBloom[uint32](500, 0.01)
+	bp := NewBloom[uintptr](500, 0.01)
+	bs := NewBloom[pair](500, 0.01) // default branch: maphash.Comparable
+	for i := 0; i < 500; i++ {
+		b64.Add(int64(i))
+		bu.Add(uint(i))
+		b32.Add(uint32(i))
+		bp.Add(uintptr(i))
+		bs.Add(pair{i, -i})
+	}
+	for i := 0; i < 500; i++ {
+		if !b64.Contains(int64(i)) || !bu.Contains(uint(i)) || !b32.Contains(uint32(i)) ||
+			!bp.Contains(uintptr(i)) || !bs.Contains(pair{i, -i}) {
+			t.Fatalf(`false negative on key %d in a typed filter`, i)
+		}
+	}
+}
+
+func TestBloomEdgeSizes(t *testing.T) {
+	var z Bloom[int] // zero value, before any Add
+	if z.Cap() != bloomDefaultItems || z.Bytes() != 0 {
+		t.Errorf(`zero value: Cap=%d Bytes=%d, want %d and 0`, z.Cap(), z.Bytes(), bloomDefaultItems)
+	}
+	tiny := NewBloom[int](0, 0.01) // expectedItems < 1 is treated as 1
+	if tiny.Cap() != 1 || tiny.Bytes() < 8 {
+		t.Errorf(`NewBloom(0): Cap=%d Bytes=%d`, tiny.Cap(), tiny.Bytes())
+	}
+	if !tiny.Add(7) || !tiny.Contains(7) {
+		t.Errorf(`a 1-key filter must hold its key`)
+	}
+	// fpRate is clamped to [1e-6, 0.5]
+	if loose, strict := NewBloom[int](1000, 0.9).Bytes(), NewBloom[int](1000, 0).Bytes(); loose >= strict {
+		t.Errorf(`clamped rates: fp 0.5 filter (%d B) should be smaller than fp 1e-6 (%d B)`, loose, strict)
+	}
+}
+
+// Far beyond capacity, words saturate (64 bits set): EstimatedLen stays
+// finite and Saturation reports the overload.
+func TestBloomOverCapacity(t *testing.T) {
+	b := NewBloom[int](10, 0.5)
+	for i := 0; i < 5000; i++ {
+		b.Add(i)
+	}
+	if s := b.Saturation(); s < 0.9 {
+		t.Errorf(`Saturation() = %.2f far over capacity, want ≥ 0.9`, s)
+	}
+	if n := b.EstimatedLen(); n <= 0 {
+		t.Errorf(`EstimatedLen() = %d on a saturated filter, want a positive finite estimate`, n)
+	}
+}
+
+// Concurrent first Adds on a zero value race to allocate the table:
+// exactly one table wins and no key is lost.
+func TestBloomZeroValueConcurrentInit(t *testing.T) {
+	for round := 0; round < 100; round++ {
+		var b Bloom[int]
+		var wg sync.WaitGroup
+		for w := 0; w < 8; w++ {
+			wg.Add(1)
+			go func(w int) {
+				defer wg.Done()
+				b.Add(w)
+			}(w)
+		}
+		wg.Wait()
+		for w := 0; w < 8; w++ {
+			if !b.Contains(w) {
+				t.Fatalf(`round %d: key %d lost in concurrent first Adds`, round, w)
+			}
+		}
+	}
+}
