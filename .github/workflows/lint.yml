@@ -15,7 +15,10 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: stable
+          # pinned like test.yml and go.mod: golangci-lint (pinned below)
+          # cannot read the export data of a newer Go ("export data version
+          # 5 is greater than maximum supported version 4" with Go 1.27)
+          go-version: '1.25.x'
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v8
