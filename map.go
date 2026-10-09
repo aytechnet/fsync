@@ -357,7 +357,16 @@ func (m *Map[K, V]) Load(key K) (value V, ok bool) {
 				psStart := cur.pins.Load()
 				meta := cur.meta.Load()
 				for j := 0; j < slotCount; j++ {
-					if uint8(meta>>(8*j)) != byte(tag) || cur.keys[j] != key {
+					if uint8(meta>>(8*j)) != byte(tag) {
+						continue
+					}
+					// copy, validate, THEN compare: a multi-word key
+					// being rewritten must never be dereferenced torn
+					k := cur.keys[j]
+					if cur.pins.Load() != psStart {
+						continue Win
+					}
+					if k != key {
 						continue
 					}
 					if psStart&(uint64(1)<<j) != 0 {
@@ -507,9 +516,18 @@ Retry:
 		}
 
 		for cur := b; cur != nil; cur = cur.next.Load() {
+			ps0 := cur.pins.Load()
 			meta := cur.meta.Load()
 			for j := 0; j < slotCount; j++ {
-				if uint8(meta>>(8*j)) == byte(tag) && cur.keys[j] == key {
+				if uint8(meta>>(8*j)) != byte(tag) {
+					continue
+				}
+				k := cur.keys[j] // copy, validate, then compare (see Load)
+				if cur.pins.Load() != ps0 {
+					runtime.Gosched()
+					goto Retry
+				}
+				if k == key {
 					bit := uint64(1) << j
 					p := cur.pins.Load()
 					if p&bit != 0 {

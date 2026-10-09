@@ -32,9 +32,17 @@ type Set[K comparable] struct {
 type bucketSet[K comparable] struct {
 	meta  atomic.Uint64 // 8 h7 tags, occupiedBit | top 7 hash bits per slot
 	state atomic.Uint32 // bucketOpen / bucketFrozen / bucketMoved
-	mu    sync.Mutex
-	keys  [slotCount]K
-	next  atomic.Pointer[bucketSet[K]]
+	// seq is a per-node seqlock: odd while Remove rewrites a slot of
+	// this node. Readers (Contains, Range) copy a key, then check seq
+	// before comparing or yielding it — a multi-word key (string) being
+	// zeroed must never be dereferenced half-written. 32 bits sit in the
+	// padding after state, so the bucket keeps its size class (a 64-bit
+	// seq pushed Set[int] from 44 to 51 B/key); wrap-around would need
+	// 2^31 Removes on one node within a single read.
+	seq  atomic.Uint32
+	mu   sync.Mutex
+	keys [slotCount]K
+	next atomic.Pointer[bucketSet[K]]
 }
 
 type tableSet[K comparable] struct {
@@ -156,13 +164,30 @@ func (s *Set[K]) Contains(key K) bool {
 			t = nt
 			continue
 		}
+	Chain:
 		for cur := b; cur != nil; cur = cur.next.Load() {
+			// Per-node seqlock (inlined: this is the hot path). Copy each
+			// candidate key, re-check seq, and only then compare it.
+		Node:
+			s0 := cur.seq.Load()
+			if s0&1 != 0 {
+				runtime.Gosched() // a Remove is rewriting this node
+				goto Node
+			}
 			meta := cur.meta.Load()
 			for j := 0; j < slotCount; j++ {
-				if uint8(meta>>(8*j)) == byte(tag) && cur.keys[j] == key {
+				if uint8(meta>>(8*j)) != byte(tag) {
+					continue
+				}
+				k := cur.keys[j]
+				if cur.seq.Load() != s0 {
+					goto Node
+				}
+				if k == key {
 					return true
 				}
 			}
+			continue Chain
 		}
 		return false
 	}
@@ -284,9 +309,11 @@ Retry:
 		meta := cur.meta.Load()
 		for j := 0; j < slotCount; j++ {
 			if uint8(meta>>(8*j)) == byte(tag) && cur.keys[j] == key {
+				cur.seq.Add(1) // odd: readers of this node wait
+				cur.meta.Store(meta &^ (uint64(0xff) << (8 * j)))
 				var zeroK K
 				cur.keys[j] = zeroK
-				cur.meta.Store(meta &^ (uint64(0xff) << (8 * j)))
+				cur.seq.Add(1) // even again
 				b.mu.Unlock()
 				s.live.Add(-1)
 				return true
@@ -341,13 +368,29 @@ func (s *Set[K]) Range(f func(key K) bool) {
 // rangeBucketChainSet walks one Set bucket's overflow chain, calling
 // f on every occupied slot. Returns false if f asked to stop.
 func rangeBucketChainSet[K comparable](b *bucketSet[K], f func(key K) bool) bool {
+	var ks [slotCount]K
 	for cur := b; cur != nil; cur = cur.next.Load() {
-		meta := cur.meta.Load()
-		for j := 0; j < slotCount; j++ {
-			if uint8(meta>>(8*j))&occupiedBit == 0 {
+		n := 0
+		for {
+			s0 := cur.seq.Load()
+			if s0&1 != 0 {
+				runtime.Gosched()
 				continue
 			}
-			if !f(cur.keys[j]) {
+			meta := cur.meta.Load()
+			n = 0
+			for j := 0; j < slotCount; j++ {
+				if uint8(meta>>(8*j))&occupiedBit != 0 {
+					ks[n] = cur.keys[j]
+					n++
+				}
+			}
+			if cur.seq.Load() == s0 {
+				break
+			}
+		}
+		for i := 0; i < n; i++ {
+			if !f(ks[i]) {
 				return false
 			}
 		}
