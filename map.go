@@ -38,11 +38,11 @@
 //   - For word-sized V (int, uint, pointer, *T) the read is
 //     hardware-atomic on amd64/arm64 and the seqlock retry covers the
 //     small window between observing pins clear and re-reading them.
-//   - For multi-word V (struct, string, slice header), the read happens
-//     between two known-clear pin observations — a torn read can only
-//     happen if a Lock holder grabs the pin, writes, AND releases
-//     entirely inside the Load window, which is rare. If your V is
-//     large and that risk matters, take Lock yourself for the read.
+//   - For multi-word V (struct, string, slice header), every in-place
+//     writer (Lock holder, Store update, Delete) pins the slot and bumps
+//     the seq, and Load validates the whole match+read window against
+//     it: a torn V is retried, never returned (since v0.5.0; before,
+//     Store's update path wrote without the seq).
 //   - For V containing INTERNAL STATE referenced through a pointer
 //     (V = map[X]Y, V = *Sub, V = struct{slice []T}, …) the seqlock
 //     protects ONLY the V header copied by Load — it does NOT protect
@@ -53,18 +53,20 @@
 //     pattern), or wrap as Map[K, *Sub] where Sub is itself
 //     concurrency-safe.
 //
-// Rebuild policy (split or duplicate):
+// Rebuild policy (split, never duplicate):
 //   - When the live count crosses the load-factor threshold the bucket
-//     table is doubled. A bucket whose pins are all clear is SPLIT into
-//     two fresh buckets according to the new bit of the mask.
-//   - A bucket with at least one pinned slot is DUPLICATED instead: the
-//     SAME bucket pointer is published into both new-table entries. The
-//     bucket keeps living at its original address, so the *V handed out
-//     by Lock stays valid across the rebuild.
-//   - A duplicated bucket is reachable from two head-table entries, so a
-//     Load on either side scans up to 8 slots whose hash may map to
-//     either new index. The key compare disambiguates; no special
-//     filtering is needed on the read path.
+//     table is doubled; each bucket is SPLIT into two fresh buckets
+//     according to the new bit of the mask.
+//   - A bucket with a pinned slot is SKIPPED, not migrated: moving it
+//     would invalidate the *V handed out by Lock. It stays open in the
+//     old table (reads and writes keep working on it) and the lazy sweep
+//     comes back to it once its pins are released; the new table is
+//     promoted only when every position has been migrated. A long-held
+//     Lock therefore delays the end of a doubling, never correctness.
+//   - Every write of a slot's key/value (Store update, Delete, migration)
+//     runs under the same pin+seq protocol as Lock/Unlock, so Load never
+//     returns a torn multi-word V nor a value being deleted, and Lock
+//     re-validates the slot (key, occupancy, bucket state) after pinning.
 //
 // Zero-value Map: `var m Map[K, V]` is usable directly; the first write
 // lazily allocates the bucket table. Use NewMap(minBuckets) to pre-size.
@@ -224,6 +226,9 @@ func (m *Map[K, V]) Grow(estimatedItems int) *Map[K, V] {
 			for idx := uint64(0); idx < n; idx++ {
 				m.helpMigrateBucket(t, idx)
 			}
+			if t.rebuildLeft.Load() > 0 {
+				runtime.Gosched() // a pinned bucket holds the doubling back
+			}
 			continue
 		}
 		m.maybeStartRebuild(t)
@@ -339,29 +344,37 @@ func (m *Map[K, V]) Load(key K) (value V, ok bool) {
 			t = nt
 			continue
 		}
+	Chain:
 		for cur := b; cur != nil; cur = cur.next.Load() {
-			meta := cur.meta.Load()
-			for j := 0; j < slotCount; j++ {
-				if uint8(meta>>(8*j)) == byte(tag) && cur.keys[j] == key {
-					bit := uint64(1) << j
-					for {
-						psStart := cur.pins.Load()
-						if psStart&bit != 0 {
-							// slot is pinned by a Lock holder; wait for
-							// Unlock then retry (the seqlock will also
-							// confirm we observed a stable window).
-							runtime.Gosched()
-							continue
-						}
-						v := cur.values[j]
-						psEnd := cur.pins.Load()
-						if psEnd == psStart {
-							return v, true
-						}
-						// a Lock acquisition (or full cycle) occurred
-						// during the read → retry
+			// Seqlock window: pins (pin bits + seq) is read BEFORE the
+			// tag scan and the key compare, and again after the value
+			// read. Every writer of a slot's key/value pins the slot and
+			// bumps the seq, so an unchanged pins word proves that the
+			// match AND the value were read with no write in between.
+		Win:
+			for {
+				psStart := cur.pins.Load()
+				meta := cur.meta.Load()
+				for j := 0; j < slotCount; j++ {
+					if uint8(meta>>(8*j)) != byte(tag) || cur.keys[j] != key {
+						continue
 					}
+					if psStart&(uint64(1)<<j) != 0 {
+						// pinned by a Lock holder or a writer: wait, then
+						// redo the whole window (the slot may be gone).
+						runtime.Gosched()
+						continue Win
+					}
+					v := cur.values[j]
+					if cur.pins.Load() == psStart {
+						return v, true
+					}
+					continue Win // a write overlapped the read: retry
 				}
+				if cur.pins.Load() != psStart {
+					continue // the scan raced a write: redo this node
+				}
+				continue Chain // not in this node
 			}
 		}
 		return
@@ -407,14 +420,15 @@ Retry:
 		for j := 0; j < slotCount; j++ {
 			if uint8(meta>>(8*j)) == byte(tag) && cur.keys[j] == key {
 				bit := uint64(1) << j
-				if cur.pins.Load()&bit != 0 {
+				if !pinSlot(cur, bit) {
 					b.mu.Unlock()
 					for cur.pins.Load()&bit != 0 {
 						runtime.Gosched()
 					}
 					goto Retry
 				}
-				cur.values[j] = value
+				cur.values[j] = value // under pin+seq: Load cannot tear it
+				unpinSlot(cur, bit)
 				b.mu.Unlock()
 				return false
 			}
@@ -425,8 +439,11 @@ Retry:
 	cur := b
 	for {
 		meta := cur.meta.Load()
+		pins := cur.pins.Load()
 		for j := 0; j < slotCount; j++ {
-			if uint8(meta>>(8*j))&occupiedBit == 0 {
+			// a free slot still pinned belongs to a Lock that raced a
+			// Delete and is about to back off: leave it alone
+			if uint8(meta>>(8*j))&occupiedBit == 0 && pins&(uint64(1)<<j) == 0 {
 				cur.keys[j] = key
 				cur.values[j] = value
 				cur.meta.Store(meta&^(uint64(0xff)<<(8*j)) | (tag << (8 * j)))
@@ -455,6 +472,13 @@ Retry:
 func (m *Map[K, V]) afterInsert(t *tableMap[K, V]) {
 	if m.live.Add(1) > int64(loadFactor)*int64(slotCount)*int64(len(t.buckets))/4 {
 		m.maybeStartRebuild(t)
+	}
+	// Help the rebuild of the CURRENT table, not only of t: once most
+	// buckets are migrated, inserts land in the next table (t is then
+	// nt), and a position skipped because it was pinned would never be
+	// revisited — the doubling would stay pending forever.
+	if cur := m.table.Load(); cur != t && cur.nextTable.Load() != nil {
+		m.helpRebuildProgress(cur, sweepBatch)
 	}
 	m.helpRebuildProgress(t, sweepBatch)
 }
@@ -496,9 +520,24 @@ Retry:
 					}
 					// Acquire: set the pin bit AND increment the seq in one
 					// CAS, so Load observes a coherent before/after window.
-					if cur.pins.CompareAndSwap(p, (p|bit)+pinsSeqUnit) {
+					if !cur.pins.CompareAndSwap(p, (p|bit)+pinsSeqUnit) {
+						goto Retry
+					}
+					// Re-validate under the pin. Lock takes no bucket mutex,
+					// so between the key match and the CAS a Delete may have
+					// freed the slot (and an insert reused it), or a migrator
+					// may have frozen the bucket to copy it. Writers and
+					// migrators all respect a pinned slot from here on, so a
+					// slot that still holds key in an open bucket is ours.
+					if b.state.Load() == bucketOpen &&
+						uint8(cur.meta.Load()>>(8*j)) == byte(tag) && cur.keys[j] == key {
 						return &cur.values[j], Cursor[K, V]{bucket: cur, slotIdx: uint(j)}, true
 					}
+					unpinSlot(cur, bit)
+					if b.state.Load() == bucketFrozen {
+						m.helpMigrateBucket(t, h&t.mask)
+					}
+					runtime.Gosched()
 					goto Retry
 				}
 			}
@@ -520,6 +559,31 @@ func (cur Cursor[K, V]) Unlock() {
 	for {
 		p := cur.bucket.pins.Load()
 		if cur.bucket.pins.CompareAndSwap(p, (p&^bit)+pinsSeqUnit) {
+			return
+		}
+	}
+}
+
+// pinSlot pins slot bit of cur for an in-place write (Store update,
+// Delete) and bumps the seq, like Lock. It fails if the slot is already
+// pinned. Callers hold the bucket mutex.
+func pinSlot[K comparable, V any](cur *bucketMap[K, V], bit uint64) bool {
+	for {
+		p := cur.pins.Load()
+		if p&bit != 0 {
+			return false
+		}
+		if cur.pins.CompareAndSwap(p, (p|bit)+pinsSeqUnit) {
+			return true
+		}
+	}
+}
+
+// unpinSlot releases a pin taken by pinSlot or Lock, bumping the seq.
+func unpinSlot[K comparable, V any](cur *bucketMap[K, V], bit uint64) {
+	for {
+		p := cur.pins.Load()
+		if cur.pins.CompareAndSwap(p, (p&^bit)+pinsSeqUnit) {
 			return
 		}
 	}
@@ -588,8 +652,9 @@ Retry:
 	cur := b
 	for {
 		meta := cur.meta.Load()
+		pins := cur.pins.Load()
 		for j := 0; j < slotCount; j++ {
-			if uint8(meta>>(8*j))&occupiedBit == 0 {
+			if uint8(meta>>(8*j))&occupiedBit == 0 && pins&(uint64(1)<<j) == 0 {
 				cur.keys[j] = key
 				cur.values[j] = value
 				// pin + seq increment atomically
@@ -683,7 +748,7 @@ Retry:
 		for j := 0; j < slotCount; j++ {
 			if uint8(meta>>(8*j)) == byte(tag) && cur.keys[j] == key {
 				bit := uint64(1) << j
-				if cur.pins.Load()&bit != 0 {
+				if !pinSlot(cur, bit) {
 					// pinned by a Lock holder — release mu and wait outside
 					b.mu.Unlock()
 					for cur.pins.Load()&bit != 0 {
@@ -691,15 +756,15 @@ Retry:
 					}
 					goto Retry
 				}
-				// publish "free" via meta with release semantics; subsequent
-				// inserts can claim the slot. Zero the key/value first so a
-				// reader who sees the new meta and walks the chain again
-				// cannot pull garbage out of a stale slot.
+				// Under pin+seq: free the slot in meta, then zero the
+				// key/value so the GC can reclaim their pointers. A Load
+				// that matched the key before sees the seq move and retries.
+				cur.meta.Store(meta &^ (uint64(0xff) << (8 * j)))
 				var zeroK K
 				var zeroV V
 				cur.keys[j] = zeroK
 				cur.values[j] = zeroV
-				cur.meta.Store(meta &^ (uint64(0xff) << (8 * j)))
+				unpinSlot(cur, bit)
 				b.mu.Unlock()
 				m.live.Add(-1)
 				return true
@@ -800,24 +865,26 @@ Retry:
 		for j := 0; j < slotCount; j++ {
 			if uint8(meta>>(8*j)) == byte(tag) && cur.keys[j] == key {
 				bit := uint64(1) << j
-				if cur.pins.Load()&bit != 0 {
+				if !pinSlot(cur, bit) {
 					b.mu.Unlock()
 					for cur.pins.Load()&bit != 0 {
 						runtime.Gosched()
 					}
 					goto Retry
 				}
-				value = cur.values[j]
+				value = cur.values[j] // under our pin: no Lock holder can write it
 				ok = true
 				if predicate != nil && !predicate(value) {
+					unpinSlot(cur, bit)
 					b.mu.Unlock()
 					return
 				}
+				cur.meta.Store(meta &^ (uint64(0xff) << (8 * j)))
 				var zeroK K
 				var zeroV V
 				cur.keys[j] = zeroK
 				cur.values[j] = zeroV
-				cur.meta.Store(meta &^ (uint64(0xff) << (8 * j)))
+				unpinSlot(cur, bit)
 				b.mu.Unlock()
 				m.live.Add(-1)
 				deleted = true
@@ -851,9 +918,8 @@ func (m *Map[K, V]) Range(f func(key K, value V) bool) {
 		if b.state.Load() == bucketMoved {
 			nt := t.nextTable.Load()
 			if nt != nil && len(nt.buckets) > 0 {
-				// scan both new-table halves that map back from this index
-				// (duplicate-on-pin can publish the same bucket twice, but
-				// the new halves cover all keys originally here).
+				// scan both new-table halves that map back from this index:
+				// together they hold every key originally here.
 				newMask := nt.mask
 				oldMask := t.mask
 				for nidx := uint64(0); nidx <= newMask; nidx++ {
@@ -875,19 +941,33 @@ func (m *Map[K, V]) Range(f func(key K, value V) bool) {
 }
 
 // rangeBucketChain walks one bucket's overflow chain, calling f on every
-// live, unpinned slot. Returns false if f asked to stop.
+// live, unpinned slot, each (key, value) pair read under the seqlock.
+// Returns false if f asked to stop.
 func rangeBucketChain[K comparable, V any](b *bucketMap[K, V], f func(key K, value V) bool) bool {
+	var ks [slotCount]K
+	var vs [slotCount]V
 	for cur := b; cur != nil; cur = cur.next.Load() {
-		meta := cur.meta.Load()
-		pins := cur.pins.Load()
-		for j := 0; j < slotCount; j++ {
-			if uint8(meta>>(8*j))&occupiedBit == 0 {
-				continue
+		// One seqlock window per node: snapshot every live, unpinned
+		// slot, then check that no write happened meanwhile (one pins
+		// re-read for 8 slots instead of one per slot).
+		n := 0
+		for {
+			ps := cur.pins.Load()
+			meta := cur.meta.Load()
+			n = 0
+			for j := 0; j < slotCount; j++ {
+				if uint8(meta>>(8*j))&occupiedBit == 0 || ps&(uint64(1)<<j) != 0 {
+					continue // free, or pinned: skip, weakly consistent
+				}
+				ks[n], vs[n] = cur.keys[j], cur.values[j]
+				n++
 			}
-			if pins&(uint64(1)<<j) != 0 {
-				continue // pinned: skip, weakly consistent
+			if cur.pins.Load() == ps {
+				break
 			}
-			if !f(cur.keys[j], cur.values[j]) {
+		}
+		for i := 0; i < n; i++ {
+			if !f(ks[i], vs[i]) {
 				return false
 			}
 		}
@@ -941,10 +1021,14 @@ func (m *Map[K, V]) helpRebuildProgress(t *tableMap[K, V], n int) {
 	}
 	heads := uint64(len(t.buckets))
 	for i := 0; i < n; i++ {
-		idx := t.rebuildIdx.Add(1) - 1
-		if idx >= heads {
+		if t.rebuildLeft.Load() <= 0 {
 			return
 		}
+		// The sweep cycles over the positions until every one is
+		// migrated: a pinned bucket is skipped, so the first pass may
+		// leave some behind. Already-migrated positions cost one atomic
+		// load (nt slot != nil) in helpMigrateBucket.
+		idx := (t.rebuildIdx.Add(1) - 1) % heads
 		m.helpMigrateBucket(t, idx)
 	}
 }
@@ -956,6 +1040,11 @@ func (m *Map[K, V]) helpMigrateBucket(t *tableMap[K, V], idx uint64) {
 	}
 	b := t.buckets[idx].Load()
 	for {
+		// A position is migrated — and counted in rebuildLeft — exactly
+		// once: its new-table slots are set by the migration itself.
+		if nt.buckets[idx].Load() != nil {
+			return
+		}
 		switch b.state.Load() {
 		case bucketMoved:
 			return
@@ -963,18 +1052,21 @@ func (m *Map[K, V]) helpMigrateBucket(t *tableMap[K, V], idx uint64) {
 			runtime.Gosched()
 			continue
 		}
+		if chainPinned(b) {
+			return // skip: a pinned slot must not move; the sweep comes back
+		}
 		if !b.state.CompareAndSwap(bucketOpen, bucketFrozen) {
 			continue
 		}
-		split := m.migrateBucket(t, nt, idx, b)
-		if split {
-			b.state.Store(bucketMoved)
-		} else {
-			// DUPLICATE: bucket stays reachable from both tables, so its
-			// state must go back to bucketOpen — writes through either
-			// table land in the same physical bucket.
+		if nt.buckets[idx].Load() != nil { // migrated between the check and the claim
 			b.state.Store(bucketOpen)
+			return
 		}
+		if !m.migrateBucket(t, nt, idx, b) {
+			b.state.Store(bucketOpen) // pinned meanwhile: skipped, retried later
+			return
+		}
+		b.state.Store(bucketMoved)
 		if t.rebuildLeft.Add(-1) <= 0 {
 			m.table.CompareAndSwap(t, nt)
 		}
@@ -982,33 +1074,37 @@ func (m *Map[K, V]) helpMigrateBucket(t *tableMap[K, V], idx uint64) {
 	}
 }
 
-// migrateBucket implements the "split if no pins, duplicate otherwise"
-// policy. The caller has set b.state = bucketFrozen, so writers and
-// migrators are excluded. We hold b.mu briefly to drain any in-flight
-// write that started before state went frozen. Returns true on split,
-// false on duplication.
+// chainPinned reports whether any slot of b's chain is pinned (only the
+// low 8 bits of pins are pin bits; the rest is the seq).
+func chainPinned[K comparable, V any](b *bucketMap[K, V]) bool {
+	for cur := b; cur != nil; cur = cur.next.Load() {
+		if cur.pins.Load()&pinsPinMask != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// migrateBucket SPLITS b into two fresh buckets of nt, or returns false
+// without touching nt if a slot is pinned. The caller has set
+// b.state = bucketFrozen: every writer taking b.mu re-checks the state
+// and backs off, and Lock (which takes no mutex) re-validates the state
+// after pinning. We take b.mu once to drain writers that passed the
+// state check before the freeze; after that, any pin either is visible
+// here (skip) or belongs to a Lock that will see bucketFrozen and back
+// off before touching the slot (the freeze and the pin are both
+// sequentially consistent atomics, so one of the two sides sees the
+// other).
 func (m *Map[K, V]) migrateBucket(t, nt *tableMap[K, V], idx uint64, b *bucketMap[K, V]) (split bool) {
 	oldSize := uint64(len(t.buckets))
 
-	// drain in-flight writers: every other writer that already passed
-	// the state==Open check must finish its in-bucket work (under
-	// b.mu) before we read its tags & pins below.
 	b.mu.Lock()
 	b.mu.Unlock() //nolint:staticcheck // SA2001: the Lock/Unlock pair is a barrier, not a real critical section
 
-	// check pin state across the whole chain (only the low 8 pin bits matter;
-	// the high 56 bits hold the seq and are always non-zero after the first
-	// Lock/Unlock cycle)
-	for cur := b; cur != nil; cur = cur.next.Load() {
-		if cur.pins.Load()&pinsPinMask != 0 {
-			// DUPLICATE: same bucket pointer in both new positions
-			nt.buckets[idx].Store(b)
-			nt.buckets[idx+oldSize].Store(b)
-			return false
-		}
+	if chainPinned(b) {
+		return false
 	}
 
-	// SPLIT: redistribute entries into two fresh buckets
 	b0 := &bucketMap[K, V]{}
 	b1 := &bucketMap[K, V]{}
 	for cur := b; cur != nil; cur = cur.next.Load() {
