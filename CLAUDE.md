@@ -1,7 +1,10 @@
 # fsync — structures concurrentes rapides
 
 Package `github.com/aytechnet/fsync` : alternatives concurrentes plus rapides que
-`sync.Map` / `puzpuzpuz/xsync` pour la plateforme iPaaS DyaPi. Go 1.25.
+`sync.Map` / `puzpuzpuz/xsync` pour la plateforme iPaaS DyaPi et la supervision
+Aytechnet (agent aymond et plan de contrôle aywatchd : statistiques de visites,
+dictionnaires, caches — `Bloom` et `Interner` y sont destinés, pas encore importés
+au 09/10/2026). Go 1.25.
 
 Huit structures, huit niches :
 

@@ -1,5 +1,6 @@
 // Package fsync provides concurrent data structures faster than sync.Map
-// and puzpuzpuz xsync for the iPaaS use cases of DyaPi.
+// and puzpuzpuz xsync, built for the DyaPi iPaaS platform and the
+// Aytechnet monitoring stack (agent statistics, dictionaries, caches).
 //
 // Map[K, V] is an xsync-style bucket-direct hash map with the unique
 // feature of an integrated per-entry pin. Each bucket carries up to 8

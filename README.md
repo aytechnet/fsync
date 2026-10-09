@@ -8,9 +8,11 @@
 `fsync` is a Go 1.25 library of high-performance, generic concurrent
 containers — drop-in replacements for `sync.Map`, `map[K]V + mutex`,
 buffered `chan`, bitsets, Bloom filters and interners. Built for the
-DyaPi iPaaS platform; eight containers, one set of guarantees:
-lock-free reads, zero-allocation hot paths, full `sync.Map`-compatible
-API, plus a stable `*V` pointer out of `Lock`.
+DyaPi iPaaS platform and the Aytechnet monitoring stack (server agent
+and control plane: per-site visit statistics, dictionaries, caches);
+eight containers, one set of guarantees: lock-free reads,
+zero-allocation hot paths, full `sync.Map`-compatible API, plus a
+stable `*V` pointer out of `Lock`.
 
 ## At a glance
 
